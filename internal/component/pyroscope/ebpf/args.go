@@ -24,6 +24,7 @@ type Arguments struct {
 	Demangle            string                 `alloy:"demangle,attr,optional"`
 	OffCPUThreshold     float64                `alloy:"off_cpu_threshold,attr,optional"`
 	LoadProbe           bool                   `alloy:"load_probe,attr,optional"`
+	MapScaleFactor      int                    `alloy:"map_scale_factor,attr,optional"`
 	UProbeLinks         []string               `alloy:"u_probe_links,attr,optional"`
 	VerboseMode         bool                   `alloy:"verbose_mode,attr,optional"`
 	LazyMode            bool                   `alloy:"lazy_mode,attr,optional"`
