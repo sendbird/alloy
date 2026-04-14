@@ -35,7 +35,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     PROFILER_DIR=$(find /go/pkg/mod/github.com/grafana/opentelemetry-ebpf-profiler@* -maxdepth 0 -type d | head -1) && \
     chmod -R u+w "$PROFILER_DIR" && \
     cd "$PROFILER_DIR" && \
-    patch -p1 < /src/alloy/patches/ebpf-profiler-map-scale-factor.patch
+    patch -p1 --no-backup-if-mismatch --forward < /src/alloy/patches/ebpf-profiler-map-scale-factor.patch || true
 
 RUN --mount=type=cache,target=/root/.cache/go-build \
     --mount=type=cache,target=/go/pkg/mod \
