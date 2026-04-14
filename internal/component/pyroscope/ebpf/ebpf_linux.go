@@ -391,6 +391,7 @@ func (args *Arguments) Convert() (*controller.Config, error) {
 	cfg.Tracers = args.tracers()
 	cfg.OffCPUThreshold = args.OffCPUThreshold
 	cfg.LoadProbe = args.LoadProbe
+	cfg.MapScaleFactor = args.MapScaleFactor
 	cfg.ProbeLinks = args.UProbeLinks
 	cfg.VerboseMode = args.VerboseMode
 	return cfg, nil

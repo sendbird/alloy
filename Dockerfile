@@ -28,12 +28,22 @@ WORKDIR /src/alloy
 
 COPY --from=ui-build /ui/dist /src/alloy/internal/web/ui/dist
 
+# Apply profiler patch for map_scale_factor support (allow negative values)
+COPY patches/ /src/alloy/patches/
+RUN --mount=type=cache,target=/go/pkg/mod \
+    go mod download && \
+    PROFILER_DIR=$(find /go/pkg/mod/github.com/grafana/opentelemetry-ebpf-profiler@* -maxdepth 0 -type d | head -1) && \
+    chmod -R u+w "$PROFILER_DIR" && \
+    cd "$PROFILER_DIR" && \
+    patch -p1 < /src/alloy/patches/ebpf-profiler-map-scale-factor.patch
+
 RUN --mount=type=cache,target=/root/.cache/go-build \
     --mount=type=cache,target=/go/pkg/mod \
     GOOS="$TARGETOS" GOARCH="$TARGETARCH" GOARM=${TARGETVARIANT#v} \
     RELEASE_BUILD=${RELEASE_BUILD} VERSION=${VERSION} \
     GO_TAGS="netgo embedalloyui promtail_journal_enabled" \
     GOEXPERIMENT=${GOEXPERIMENT} \
+    GOFLAGS=-mod=mod \
     SKIP_UI_BUILD=1 \
     make alloy
 
