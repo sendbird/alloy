@@ -55,22 +55,25 @@ The following strings are valid log line formats:
 
 You can use the following blocks with `faro.receiver`:
 
+{{< docs/alloy-config >}}
+
 | Block                                        | Description                                          | Required |
 |----------------------------------------------|------------------------------------------------------|----------|
 | [`output`][output]                           | Configures where to send collected telemetry data.   | yes      |
 | [`server`][server]                           | Configures the HTTP server.                          | no       |
 | `server` >  [`rate_limiting`][rate_limiting] | Configures rate limiting for the HTTP server.        | no       |
 | [`sourcemaps`][sourcemaps]                   | Configures sourcemap retrieval.                      | no       |
-| `sourcemaps` >  [`location`][location]       | Configures on-disk location for sourcemap retrieval. | no       |
+| `sourcemaps` > [`cache`][cache]              | Configures sourcemap caching behavior.               | no       |
+| `sourcemaps` >  [`location`][location]       | Configures the location for sourcemap retrieval.     | no       |
 
-The > symbol indicates deeper levels of nesting.
-For example, `sourcemaps` > `location` refers to a `location` block defined inside a `sourcemaps` block.
-
+[cache]: #cache
 [location]: #location
 [output]: #output
 [rate_limiting]: #rate_limiting
 [server]: #server
 [sourcemaps]: #sourcemaps
+
+{{< /docs/alloy-config >}}
 
 ### `output`
 
@@ -149,7 +152,7 @@ The `sourcemaps` block configures how to retrieve sourcemaps.
 Sourcemaps are then used to transform file and line information from minified code into the file and line information from the original source code.
 
 | Name                    | Type           | Description                                | Default | Required |
-|-------------------------|----------------|--------------------------------------------|---------|----------|
+| ----------------------- | -------------- | ------------------------------------------ | ------- | -------- |
 | `download`              | `bool`         | Whether to download sourcemaps.            | `true`  | no       |
 | `download_from_origins` | `list(string)` | Which origins to download sourcemaps from. | `["*"]` | no       |
 | `download_timeout`      | `duration`     | Timeout when downloading sourcemaps.       | `"1s"`  | no       |
@@ -165,18 +168,37 @@ The `*` character indicates a wildcard.
 By default, sourcemap downloads are subject to a timeout of `"1s"`, specified by the `download_timeout` argument.
 Setting `download_timeout` to `"0s"` disables timeouts.
 
-To retrieve sourcemaps from disk instead of the network, specify one or more [`location` blocks][location].
+To retrieve sourcemaps from disk or another network location, specify one or more [`location` blocks][location].
 When `location` blocks are provided, they're checked first for sourcemaps before falling back to downloading.
+
+#### `cache`
+
+The `cache` block configures sourcemap caching behavior.
+
+| Name                     | Type       | Description                                                                               | Default | Required |
+| ------------------------ | ---------- | ----------------------------------------------------------------------------------------- | ------- | -------- |
+| `cleanup_check_interval` | `duration` | How often {{< param "PRODUCT_NAME" >}} checks cached sourcemaps for cleanup.              | `"30s"` | no       |
+| `error_cleanup_interval` | `duration` | How long {{< param "PRODUCT_NAME" >}} waits before retrying a failed source map download. | `"1h"`  | no       |
+| `ttl`                    | `duration` | How long {{< param "PRODUCT_NAME" >}} keeps an unused source map in the cache.            | `inf`   | no       |
+
+By default, {{< param "PRODUCT_NAME" >}} keeps sourcemaps in memory indefinitely.
+Set `ttl` to remove sourcemaps that are not accessed within the specified duration.
+
+{{< param "PRODUCT_NAME" >}} caches errors that occur while downloading or parsing a sourcemap.
+Use `error_cleanup_interval` to control how long these errors remain cached.
+
+Cached sourcemaps are checked for cleanup every 30 seconds by default.
+Set `cleanup_check_interval` to adjust this frequency.
 
 #### `location`
 
 The `location` block declares a location where sourcemaps are stored on the filesystem.
 You can specify the `location` block multiple times to declare multiple locations where sourcemaps are stored.
 
-| Name                   | Type     | Description                                         | Default | Required |
-|------------------------|----------|-----------------------------------------------------|---------|----------|
-| `minified_path_prefix` | `string` | The prefix of the minified path sent from browsers. |         | yes      |
-| `path`                 | `string` | The path on disk where sourcemaps are stored.       |         | yes      |
+| Name                   | Type     | Description                                               | Default | Required |
+|------------------------|----------|-----------------------------------------------------------|---------|----------|
+| `minified_path_prefix` | `string` | The prefix of the minified path sent from browsers.       |         | yes      |
+| `path`                 | `string` | The path on disk or base URL where sourcemaps are stored. |         | yes      |
 
 The `minified_path_prefix` argument determines the prefix of paths to JavaScript files, such as `http://example.com/`.
 The `path` argument then determines where to find the sourcemap for the file.
@@ -197,6 +219,35 @@ To look up the sourcemaps for a file hosted at `http://example.com/example.js`, 
 
 Optionally, the value for the `path` argument may contain `{{ .Release }}` as a template value, such as `/var/my-app/{{ .Release }}/build`.
 The template value is replaced with the release value provided by the [Faro Web App SDK][faro-sdk].
+
+When you specify a remote location, the procedure for retrieving the sourcemaps is the same as for a location block with a local path, except that the component retrieves the sourcemap from a remote HTTP server.
+
+In the following example, the `faro.receiver` sends a GET request to `http://storage.example.com/blob/sourcemaps/example.js.map` and retrieves the sourcemap for a file hosted at
+`http://example.com/example.js`.
+
+You can specify multiple location blocks. For example:
+
+```alloy
+location {
+    path                 = "http://storage.example.com/blob/sourcemaps/"
+    minified_path_prefix = "http://example.com/"
+}
+
+```alloy
+location {
+    path                 = "/var/my-app/build"
+    minified_path_prefix = "http://example.com/"
+}
+location {
+    path                 = "http://storage.example.com/blob/sourcemaps/"
+    minified_path_prefix = "http://example.com/"
+}
+```
+
+The `faro.receiver` component searches through all locations for the sourcemap files.
+Local on-disk paths take precedence over remote paths.
+For a file hosted at `http://example.com/example.js`, the `faro.receiver` first checks
+the path `/var/my-app/build/example.js.map`, and then tries to retrieve `http://storage.example.com/blob/sourcemaps/example.js.map`.
 
 ## Exported fields
 
@@ -223,7 +274,7 @@ The template value is replaced with the release value provided by the [Faro Web 
 * `faro_receiver_request_message_bytes` (histogram): Size (in bytes) of HTTP requests received from clients.
 * `faro_receiver_response_message_bytes` (histogram): Size (in bytes) of HTTP responses sent to clients.
 * `faro_receiver_inflight_requests` (gauge): Current number of inflight requests.
-* `faro_receiver_sourcemap_cache_size` (counter): Number of items in sourcemap cache per origin.
+* `faro_receiver_sourcemap_cache_size` (gauge): Number of items in sourcemap cache per origin.
 * `faro_receiver_sourcemap_downloads_total` (counter): Total number of sourcemap downloads performed per origin and status.
 * `faro_receiver_sourcemap_file_reads_total` (counter): Total number of sourcemap retrievals using the filesystem per origin and status.
 * `faro_receiver_rate_limiter_active_app` (gauge): Number of active applications with rate limiters. Inactive limiters are cleaned up every 10 minutes.
@@ -246,7 +297,7 @@ faro.receiver "default" {
 
     output {
         logs   = [loki.write.default.receiver]
-        traces = [otelcol.exporter.otlp.traces.input]
+        traces = [otelcol.exporter.otlphttp.traces.input]
     }
 }
 
@@ -256,7 +307,7 @@ loki.write "default" {
     }
 }
 
-otelcol.exporter.otlp "traces" {
+otelcol.exporter.otlphttp "traces" {
     client {
         endpoint = "<OTLP_ADDRESS>"
     }
@@ -272,10 +323,10 @@ Replace the following:
 * `LOKI_ADDRESS`: Address of the Loki server to send logs to.
   Refer to [`loki.write`][loki.write] if you want to use authentication to send logs to the Loki server.
 * _`<OTLP_ADDRESS>`_: The address of the OTLP-compatible server to send traces to.
-  Refer to[`otelcol.exporter.otlp`][otelcol.exporter.otlp] if you want to use authentication to send logs to the Loki server.
+  Refer to[`otelcol.exporter.otlphttp`][otelcol.exporter.otlphttp] if you want to use authentication to send logs to an OTLP server.
 
 [loki.write]: ../../loki/loki.write/
-[otelcol.exporter.otlp]: ../../otelcol/otelcol.exporter.otlp/
+[otelcol.exporter.otlphttp]: ../../otelcol/otelcol.exporter.otlphttp/
 
 <!-- START GENERATED COMPATIBLE COMPONENTS -->
 

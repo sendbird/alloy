@@ -85,6 +85,7 @@ body:
       - mimir.rules.kubernetes
       - otelcol.auth.basic
       - otelcol.auth.bearer
+      - otelcol.auth.google
       - otelcol.auth.headers
       - otelcol.auth.oauth2
       - otelcol.auth.sigv4
@@ -119,6 +120,7 @@ body:
       - otelcol.processor.interval
       - otelcol.processor.k8sattributes
       - otelcol.processor.memory_limiter
+      - otelcol.processor.metric_start_time
       - otelcol.processor.probabilistic_sampler
       - otelcol.processor.resourcedetection
       - otelcol.processor.span

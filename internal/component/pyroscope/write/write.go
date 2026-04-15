@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"path"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -19,13 +20,15 @@ import (
 	"github.com/grafana/alloy/internal/component/common/config"
 	"github.com/grafana/alloy/internal/component/pyroscope"
 	"github.com/grafana/alloy/internal/component/pyroscope/util"
+	"github.com/grafana/alloy/internal/component/pyroscope/write/debuginfo"
+	"github.com/grafana/alloy/internal/component/pyroscope/write/promhttp2"
 	"github.com/grafana/dskit/backoff"
+	"github.com/grafana/pyroscope/api/gen/proto/go/debuginfo/v1alpha1/debuginfov1alpha1connect"
 	pushv1 "github.com/grafana/pyroscope/api/gen/proto/go/push/v1"
 	"github.com/grafana/pyroscope/api/gen/proto/go/push/v1/pushv1connect"
 	typesv1 "github.com/grafana/pyroscope/api/gen/proto/go/types/v1"
 	"github.com/grafana/pyroscope/api/model/labelset"
 	"github.com/prometheus/client_golang/prometheus"
-	commonconfig "github.com/prometheus/common/config"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/model/labels"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
@@ -33,6 +36,9 @@ import (
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
 )
+
+const SchemeHTTPS = "https"
+const SchemeHTTP = "http"
 
 var (
 	DefaultArguments = func() Arguments {
@@ -112,6 +118,12 @@ type Component struct {
 	metrics       *metrics
 	userAgent     string
 	uid           string
+	dataPath      string
+
+	mu             sync.Mutex
+	receiver       *fanOutClient
+	runCtx         context.Context
+	receiverCancel context.CancelFunc
 }
 
 // Exports are the set of fields exposed by the pyroscope.write component.
@@ -126,11 +138,12 @@ func New(
 	reg prometheus.Registerer,
 	onStateChange func(Exports),
 	userAgent, uid string,
+	dataPath string,
 	c Arguments,
 ) (*Component, error) {
 
 	m := newMetrics(reg)
-	receiver, err := newFanOut(logger, tracer, c, m, userAgent, uid)
+	receiver, err := newFanOut(logger, tracer, c, m, userAgent, uid, dataPath)
 	if err != nil {
 		return nil, err
 	}
@@ -145,65 +158,149 @@ func New(
 		metrics:       m,
 		userAgent:     userAgent,
 		uid:           uid,
+		dataPath:      dataPath,
+		receiver:      receiver,
 	}, nil
 }
 
 // Run implements Component.
 func (c *Component) Run(ctx context.Context) error {
+	var receiverCtx context.Context
+
+	c.mu.Lock()
+	c.runCtx = ctx
+	receiverCtx, c.receiverCancel = context.WithCancel(ctx)
+	c.receiver.Start(receiverCtx)
+	c.mu.Unlock()
+
 	<-ctx.Done()
+
+	c.mu.Lock()
+	c.receiverCancel()
+	c.receiver.Wait()
+	c.runCtx = nil
+	c.receiverCancel = nil
+	c.mu.Unlock()
+
 	return ctx.Err()
 }
 
 // Update implements Component.
 func (c *Component) Update(newConfig Arguments) error {
 	c.cfg = newConfig
-	receiver, err := newFanOut(c.logger, c.tracer, newConfig, c.metrics, c.userAgent, c.uid)
+	receiver, err := newFanOut(c.logger, c.tracer, newConfig, c.metrics, c.userAgent, c.uid, c.dataPath)
 	if err != nil {
 		return err
 	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.receiverCancel != nil {
+		c.receiverCancel()
+		c.receiver.Wait()
+	}
+
+	c.receiver = receiver
 	c.onStateChange(Exports{Receiver: receiver})
+
+	if c.runCtx != nil {
+		var receiverCtx context.Context
+		receiverCtx, c.receiverCancel = context.WithCancel(c.runCtx)
+		c.receiver.Start(receiverCtx)
+	}
+
 	return nil
 }
 
+type endpointClient struct {
+	options      *EndpointOptions
+	pushClient   pushv1connect.PusherServiceClient
+	debugInfo    *debuginfo.Client
+	ingestClient *http.Client
+
+	h2cClient *http.Client
+}
+
 type fanOutClient struct {
-	// The list of push clients to fan out to.
-	pushClients   []pushv1connect.PusherServiceClient
-	ingestClients map[*EndpointOptions]*http.Client
-	config        Arguments
-	metrics       *metrics
-	tracer        trace.Tracer
-	logger        log.Logger
+	endpoints  []*endpointClient
+	config     Arguments
+	metrics    *metrics
+	tracer     trace.Tracer
+	logger     log.Logger
+	uploaderWg sync.WaitGroup
+}
+
+func (f *fanOutClient) DebugInfoClients() []debuginfov1alpha1connect.DebuginfoServiceClient {
+	var clients []debuginfov1alpha1connect.DebuginfoServiceClient
+	for _, client := range f.endpoints {
+		clients = append(clients, client.debugInfo.DebugInfoClients()...)
+	}
+	return clients
+}
+
+func (f *fanOutClient) Upload(j debuginfo.UploadJob) {
+	for _, ec := range f.endpoints {
+		ec.debugInfo.Upload(j)
+	}
+}
+
+func (f *fanOutClient) Start(ctx context.Context) {
+	for _, ec := range f.endpoints {
+		u := ec.debugInfo
+		f.uploaderWg.Add(1)
+		go func(c *debuginfo.Client) {
+			defer f.uploaderWg.Done()
+			if err := c.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+				level.Error(f.logger).Log("msg", "debuginfo uploader error", "err", err)
+			}
+		}(u)
+	}
+}
+
+func (f *fanOutClient) Wait() {
+	f.uploaderWg.Wait()
 }
 
 // newFanOut creates a new fan out client that will fan out to all endpoints.
-func newFanOut(logger log.Logger, tracer trace.Tracer, config Arguments, metrics *metrics, userAgent string, uid string) (*fanOutClient, error) {
-	pushClients := make([]pushv1connect.PusherServiceClient, 0, len(config.Endpoints))
-	ingestClients := make(map[*EndpointOptions]*http.Client)
+func newFanOut(logger log.Logger, tracer trace.Tracer, config Arguments, metrics *metrics, userAgent string, uid string, dataPath string) (*fanOutClient, error) {
+	endpoints := make([]*endpointClient, 0, len(config.Endpoints))
 
-	for _, endpoint := range config.Endpoints {
+	for i, endpoint := range config.Endpoints {
 		if endpoint.Headers == nil {
 			endpoint.Headers = map[string]string{}
 		}
 		endpoint.Headers["X-Alloy-Id"] = uid
-		httpClient, err := commonconfig.NewClientFromConfig(*endpoint.HTTPClientConfig.Convert(), endpoint.Name)
+		httpClient, err := promhttp2.NewClientFromConfig(*endpoint.HTTPClientConfig.Convert(), endpoint.Name)
 		if err != nil {
 			return nil, err
 		}
 		configureTracing(config, httpClient)
 
-		pushClients = append(
-			pushClients,
-			pushv1connect.NewPusherServiceClient(httpClient, endpoint.URL, WithUserAgent(userAgent)),
-		)
-		ingestClients[endpoint] = httpClient
+		endpointDataPath := filepath.Join(dataPath, fmt.Sprintf("endpoint-%d", i))
+		h2Client, err := newHTTP2Client(endpoint)
+		if err != nil {
+			return nil, err
+		}
+
+		debugInfoConnect := debuginfov1alpha1connect.NewDebuginfoServiceClient(h2Client, endpoint.URL, WithUserAgent(userAgent))
+		debugInfo := debuginfo.NewClient(logger, debugInfoConnect, metrics.debugInfoUploadBytes, endpointDataPath)
+
+		endpoints = append(endpoints, &endpointClient{
+			options:      endpoint,
+			pushClient:   pushv1connect.NewPusherServiceClient(httpClient, endpoint.URL, WithUserAgent(userAgent)),
+			debugInfo:    debugInfo,
+			ingestClient: httpClient,
+			h2cClient:    h2Client,
+		})
 	}
+
 	return &fanOutClient{
-		logger:        logger,
-		tracer:        tracer,
-		pushClients:   pushClients,
-		ingestClients: ingestClients,
-		config:        config,
-		metrics:       metrics,
+		logger:    logger,
+		tracer:    tracer,
+		endpoints: endpoints,
+		config:    config,
+		metrics:   metrics,
 	}, nil
 }
 
@@ -246,42 +343,41 @@ func (f *fanOutClient) Push(
 		)
 	}()
 
-	for i, client := range f.pushClients {
+	for _, ec := range f.endpoints {
 		var (
-			client  = client
-			i       = i
+			ec      = ec
 			backoff = backoff.New(ctx, backoff.Config{
-				MinBackoff: f.config.Endpoints[i].MinBackoff,
-				MaxBackoff: f.config.Endpoints[i].MaxBackoff,
-				MaxRetries: f.config.Endpoints[i].MaxBackoffRetries,
+				MinBackoff: ec.options.MinBackoff,
+				MaxBackoff: ec.options.MaxBackoff,
+				MaxRetries: ec.options.MaxBackoffRetries,
 			})
 			err error
 		)
 		wg.Add(1)
 		go func() {
-			defer f.observeLatency(f.config.Endpoints[i].URL, "push_endpoint")()
+			defer f.observeLatency(ec.options.URL, "push_endpoint")()
 			defer wg.Done()
 			req := connect.NewRequest(req.Msg)
-			for k, v := range f.config.Endpoints[i].Headers {
+			for k, v := range ec.options.Headers {
 				req.Header().Set(k, v)
 			}
 			for {
 				err = func() error {
-					defer f.observeLatency(f.config.Endpoints[i].URL, "push_downstream")()
-					ctx, cancel := context.WithTimeout(ctx, f.config.Endpoints[i].RemoteTimeout)
+					defer f.observeLatency(ec.options.URL, "push_downstream")()
+					ctx, cancel := context.WithTimeout(ctx, ec.options.RemoteTimeout)
 					defer cancel()
 
-					_, err := client.Push(ctx, req)
+					_, err := ec.pushClient.Push(ctx, req)
 					return err
 				}()
 				if err == nil {
-					f.metrics.sentBytes.WithLabelValues(f.config.Endpoints[i].URL).Add(float64(reqSize))
-					f.metrics.sentProfiles.WithLabelValues(f.config.Endpoints[i].URL).Add(float64(profileCount))
+					f.metrics.sentBytes.WithLabelValues(ec.options.URL).Add(float64(reqSize))
+					f.metrics.sentProfiles.WithLabelValues(ec.options.URL).Add(float64(profileCount))
 					break
 				}
 				_ = level.Debug(l).Log("msg",
 					"failed to push to endpoint",
-					"endpoint", f.config.Endpoints[i].URL,
+					"endpoint", ec.options.URL,
 					"retries", backoff.NumRetries(),
 					"err", err,
 				)
@@ -292,12 +388,12 @@ func (f *fanOutClient) Push(
 				if !backoff.Ongoing() {
 					break
 				}
-				f.metrics.retries.WithLabelValues(f.config.Endpoints[i].URL).Inc()
+				f.metrics.retries.WithLabelValues(ec.options.URL).Inc()
 			}
 			if err != nil {
-				f.metrics.droppedBytes.WithLabelValues(f.config.Endpoints[i].URL).Add(float64(reqSize))
-				f.metrics.droppedProfiles.WithLabelValues(f.config.Endpoints[i].URL).Add(float64(profileCount))
-				err = fmt.Errorf("failed to push to endpoint %s (%d retries): %w", f.config.Endpoints[i].URL, backoff.NumRetries(), err)
+				f.metrics.droppedBytes.WithLabelValues(ec.options.URL).Add(float64(reqSize))
+				f.metrics.droppedProfiles.WithLabelValues(ec.options.URL).Add(float64(profileCount))
+				err = fmt.Errorf("failed to push to endpoint %s (%d retries): %w", ec.options.URL, backoff.NumRetries(), err)
 				util.ErrorsJoinConcurrent(&errs, err, &errorMut)
 			}
 		}()
@@ -473,25 +569,24 @@ func (f *fanOutClient) AppendIngest(ctx context.Context, profile *pyroscope.Inco
 	query.Set("name", ls.Normalized())
 
 	// Send to each endpoint concurrently
-	for endpointIdx, endpoint := range f.config.Endpoints {
+	for _, ec := range f.endpoints {
 		var (
-			endpoint = endpoint
-			i        = endpointIdx
-			backoff  = backoff.New(ctx, backoff.Config{
-				MinBackoff: f.config.Endpoints[i].MinBackoff,
-				MaxBackoff: f.config.Endpoints[i].MaxBackoff,
-				MaxRetries: f.config.Endpoints[i].MaxBackoffRetries,
+			ec      = ec
+			backoff = backoff.New(ctx, backoff.Config{
+				MinBackoff: ec.options.MinBackoff,
+				MaxBackoff: ec.options.MaxBackoff,
+				MaxRetries: ec.options.MaxBackoffRetries,
 			})
 			err error
 		)
 		wg.Add(1)
 		go func() {
-			defer f.observeLatency(endpoint.URL, "ingest_endpoint")()
+			defer f.observeLatency(ec.options.URL, "ingest_endpoint")()
 			defer wg.Done()
 			for {
 				err = func() error {
-					defer f.observeLatency(endpoint.URL, "ingest_downstream")()
-					u, err := url.Parse(endpoint.URL)
+					defer f.observeLatency(ec.options.URL, "ingest_downstream")()
+					u, err := url.Parse(ec.options.URL)
 					if err != nil {
 						return fmt.Errorf("parse URL: %w", err)
 					}
@@ -501,7 +596,7 @@ func (f *fanOutClient) AppendIngest(ctx context.Context, profile *pyroscope.Inco
 					// attach labels
 					u.RawQuery = query.Encode()
 
-					ctx, cancel := context.WithTimeout(ctx, f.config.Endpoints[i].RemoteTimeout)
+					ctx, cancel := context.WithTimeout(ctx, ec.options.RemoteTimeout)
 					defer cancel()
 
 					req, err := http.NewRequestWithContext(ctx, "POST", u.String(), bytes.NewReader(profile.RawBody))
@@ -510,7 +605,7 @@ func (f *fanOutClient) AppendIngest(ctx context.Context, profile *pyroscope.Inco
 					}
 
 					// set headers from endpoint
-					for k, v := range endpoint.Headers {
+					for k, v := range ec.options.Headers {
 						req.Header.Set(k, v)
 					}
 
@@ -523,7 +618,7 @@ func (f *fanOutClient) AppendIngest(ctx context.Context, profile *pyroscope.Inco
 						req.Header.Add(pyroscope.HeaderContentType, profile.ContentType[idx])
 					}
 
-					resp, err := f.ingestClients[endpoint].Do(req)
+					resp, err := ec.ingestClient.Do(req)
 					if err != nil {
 						return fmt.Errorf("do request: %w", err)
 					}
@@ -544,13 +639,13 @@ func (f *fanOutClient) AppendIngest(ctx context.Context, profile *pyroscope.Inco
 					return nil
 				}()
 				if err == nil {
-					f.metrics.sentBytes.WithLabelValues(f.config.Endpoints[i].URL).Add(float64(reqSize))
-					f.metrics.sentProfiles.WithLabelValues(f.config.Endpoints[i].URL).Add(float64(profileCount))
+					f.metrics.sentBytes.WithLabelValues(ec.options.URL).Add(float64(reqSize))
+					f.metrics.sentProfiles.WithLabelValues(ec.options.URL).Add(float64(profileCount))
 					break
 				}
 				_ = level.Debug(l).Log(
 					"msg", "failed to ingest to endpoint",
-					"endpoint", f.config.Endpoints[i].URL,
+					"endpoint", ec.options.URL,
 					"retries", backoff.NumRetries(),
 					"err", err)
 				if !shouldRetry(err) {
@@ -560,12 +655,12 @@ func (f *fanOutClient) AppendIngest(ctx context.Context, profile *pyroscope.Inco
 				if !backoff.Ongoing() {
 					break
 				}
-				f.metrics.retries.WithLabelValues(f.config.Endpoints[i].URL).Inc()
+				f.metrics.retries.WithLabelValues(ec.options.URL).Inc()
 			}
 			if err != nil {
-				f.metrics.droppedBytes.WithLabelValues(f.config.Endpoints[i].URL).Add(float64(reqSize))
-				f.metrics.droppedProfiles.WithLabelValues(f.config.Endpoints[i].URL).Add(float64(profileCount))
-				err = fmt.Errorf("failed to ingest to endpoint %s (%d retries): %w", f.config.Endpoints[i].URL, backoff.NumRetries(), err)
+				f.metrics.droppedBytes.WithLabelValues(ec.options.URL).Add(float64(reqSize))
+				f.metrics.droppedProfiles.WithLabelValues(ec.options.URL).Add(float64(profileCount))
+				err = fmt.Errorf("failed to ingest to endpoint %s (%d retries): %w", ec.options.URL, backoff.NumRetries(), err)
 				util.ErrorsJoinConcurrent(&errs, err, &errorMut)
 			}
 		}()
@@ -657,6 +752,33 @@ func validateLabels(lbls labels.Labels) error {
 	})
 
 	return err
+}
+
+// newHTTP2Client creates an HTTP/2-guaranteed client for this endpoint.
+// For http:// URLs it uses h2c; for https:// it uses HTTP/2 over TLS.
+func newHTTP2Client(opt *EndpointOptions) (*http.Client, error) {
+	u, err := url.Parse(opt.URL)
+	if err != nil {
+		return nil, err
+	}
+	cfg := *opt.HTTPClientConfig.Convert()
+	switch u.Scheme {
+	case SchemeHTTP:
+		return promhttp2.NewClientFromConfigMirror(promhttp2.HTTPClientConfigMirror{
+			HTTPClientConfig: cfg,
+			H2C:              true,
+		}, opt.Name)
+	case SchemeHTTPS:
+		httpCfg := cfg
+		httpCfg.EnableHTTP2 = true
+		return promhttp2.NewClientFromConfigMirror(promhttp2.HTTPClientConfigMirror{HTTPClientConfig: httpCfg}, opt.Name)
+	default:
+		return nil, fmt.Errorf("unsupported scheme for HTTP/2 client: %s", u.Scheme)
+	}
+}
+
+func (ec *endpointClient) http2Client() *http.Client {
+	return ec.h2cClient
 }
 
 func configureTracing(config Arguments, httpClient *http.Client) {

@@ -17,6 +17,8 @@ import (
 	"reflect"
 	"sync"
 
+	"github.com/grafana/alloy/internal/component/pyroscope/write/debuginfo"
+	"github.com/grafana/pyroscope/api/gen/proto/go/debuginfo/v1alpha1/debuginfov1alpha1connect"
 	"go.uber.org/atomic"
 
 	"github.com/grafana/alloy/internal/component"
@@ -301,4 +303,12 @@ func toLabelsLabels(ls model.LabelSet) labels.Labels {
 	// Labels need to be sorted
 	result.Sort()
 	return result.Labels()
+}
+
+func (c *Component) Upload(j debuginfo.UploadJob) {
+	c.fanout.Upload(j)
+}
+
+func (c *Component) DebugInfoClients() []debuginfov1alpha1connect.DebuginfoServiceClient {
+	return c.fanout.DebugInfoClients()
 }

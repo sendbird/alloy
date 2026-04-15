@@ -1,93 +1,104 @@
 package client
 
 import (
+	"time"
+
 	"github.com/grafana/alloy/internal/util"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
 const (
-	HostLabel   = "host"
-	TenantLabel = "tenant"
-	ReasonLabel = "reason"
+	labelHost   = "host"
+	labelTenant = "tenant"
+	labelReason = "reason"
 
-	ReasonGeneric       = "ingester_error"
-	ReasonRateLimited   = "rate_limited"
-	ReasonStreamLimited = "stream_limited"
-	ReasonLineTooLong   = "line_too_long"
+	reasonGeneric       = "ingester_error"
+	reasonRateLimited   = "rate_limited"
+	reasonStreamLimited = "stream_limited"
+	reasonLineTooLong   = "line_too_long"
+	reasonQueueIsFull   = "queue_is_full"
 )
 
-var Reasons = []string{ReasonGeneric, ReasonRateLimited, ReasonStreamLimited, ReasonLineTooLong}
+var reasons = []string{reasonGeneric, reasonRateLimited, reasonStreamLimited, reasonLineTooLong, reasonQueueIsFull}
 
-type Metrics struct {
-	encodedBytes                 *prometheus.CounterVec
+type metrics struct {
 	sentBytes                    *prometheus.CounterVec
 	droppedBytes                 *prometheus.CounterVec
 	sentEntries                  *prometheus.CounterVec
 	droppedEntries               *prometheus.CounterVec
-	mutatedEntries               *prometheus.CounterVec
-	mutatedBytes                 *prometheus.CounterVec
+	requestSize                  *prometheus.HistogramVec
 	requestDuration              *prometheus.HistogramVec
 	batchRetries                 *prometheus.CounterVec
+	entryLatency                 *prometheus.HistogramVec
 	countersWithHostTenant       []*prometheus.CounterVec
 	countersWithHostTenantReason []*prometheus.CounterVec
 }
 
-func NewMetrics(reg prometheus.Registerer) *Metrics {
-	var m Metrics
+func newMetrics(reg prometheus.Registerer) *metrics {
+	var m metrics
 
-	m.encodedBytes = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Name: "loki_write_encoded_bytes_total",
-		Help: "Number of bytes encoded and ready to send.",
-	}, []string{HostLabel, TenantLabel})
 	m.sentBytes = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "loki_write_sent_bytes_total",
 		Help: "Number of bytes sent.",
-	}, []string{HostLabel, TenantLabel})
+	}, []string{labelHost, labelTenant})
 	m.droppedBytes = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "loki_write_dropped_bytes_total",
 		Help: "Number of bytes dropped because failed to be sent to the ingester after all retries.",
-	}, []string{HostLabel, TenantLabel, ReasonLabel})
+	}, []string{labelHost, labelTenant, labelReason})
 	m.sentEntries = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "loki_write_sent_entries_total",
 		Help: "Number of log entries sent to the ingester.",
-	}, []string{HostLabel, TenantLabel})
+	}, []string{labelHost, labelTenant})
 	m.droppedEntries = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "loki_write_dropped_entries_total",
 		Help: "Number of log entries dropped because failed to be sent to the ingester after all retries.",
-	}, []string{HostLabel, TenantLabel, ReasonLabel})
-	m.mutatedEntries = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Name: "loki_write_mutated_entries_total",
-		Help: "The total number of log entries that have been mutated.",
-	}, []string{HostLabel, TenantLabel, ReasonLabel})
-	m.mutatedBytes = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Name: "loki_write_mutated_bytes_total",
-		Help: "The total number of bytes that have been mutated.",
-	}, []string{HostLabel, TenantLabel, ReasonLabel})
+	}, []string{labelHost, labelTenant, labelReason})
+
+	const (
+		KiB = 1024
+		MiB = 1024 * KiB
+	)
+
+	m.entryLatency = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name:                            "loki_write_entry_propagation_latency_seconds",
+		Help:                            "Write latency for entries",
+		Buckets:                         []float64{0.1, 0.5, 1, 5, 10, 30, 60, 120, 300, 600},
+		NativeHistogramBucketFactor:     1.1,
+		NativeHistogramMaxBucketNumber:  100,
+		NativeHistogramMinResetDuration: 1 * time.Hour,
+	}, []string{labelHost, labelTenant})
+	m.requestSize = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name:                            "loki_write_request_size_bytes",
+		Help:                            "Number of bytes for requests.",
+		Buckets:                         []float64{1 * KiB, 4 * KiB, 16 * KiB, 64 * KiB, 256 * KiB, 512 * KiB, 1 * MiB, 2 * MiB, 4 * MiB, 8 * MiB, 16 * MiB, 20 * MiB},
+		NativeHistogramBucketFactor:     1.1,
+		NativeHistogramMaxBucketNumber:  100,
+		NativeHistogramMinResetDuration: 1 * time.Hour,
+	}, []string{labelHost, labelTenant})
 	m.requestDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Name: "loki_write_request_duration_seconds",
 		Help: "Duration of send requests.",
-	}, []string{"status_code", HostLabel, TenantLabel})
+	}, []string{"status_code", labelHost, labelTenant})
 	m.batchRetries = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "loki_write_batch_retries_total",
 		Help: "Number of times batches has had to be retried.",
-	}, []string{HostLabel, TenantLabel})
+	}, []string{labelHost, labelTenant})
 
 	m.countersWithHostTenant = []*prometheus.CounterVec{
-		m.batchRetries, m.encodedBytes, m.sentBytes, m.sentEntries,
+		m.batchRetries, m.sentBytes, m.sentEntries,
 	}
 
 	m.countersWithHostTenantReason = []*prometheus.CounterVec{
-		m.droppedBytes, m.droppedEntries, m.mutatedEntries, m.mutatedBytes,
+		m.droppedBytes, m.droppedEntries,
 	}
 
 	if reg != nil {
-		m.encodedBytes = util.MustRegisterOrGet(reg, m.encodedBytes).(*prometheus.CounterVec)
 		m.sentBytes = util.MustRegisterOrGet(reg, m.sentBytes).(*prometheus.CounterVec)
 		m.droppedBytes = util.MustRegisterOrGet(reg, m.droppedBytes).(*prometheus.CounterVec)
 		m.sentEntries = util.MustRegisterOrGet(reg, m.sentEntries).(*prometheus.CounterVec)
 		m.droppedEntries = util.MustRegisterOrGet(reg, m.droppedEntries).(*prometheus.CounterVec)
-		m.mutatedEntries = util.MustRegisterOrGet(reg, m.mutatedEntries).(*prometheus.CounterVec)
-		m.mutatedBytes = util.MustRegisterOrGet(reg, m.mutatedBytes).(*prometheus.CounterVec)
+		m.entryLatency = util.MustRegisterOrGet(reg, m.entryLatency).(*prometheus.HistogramVec)
+		m.requestSize = util.MustRegisterOrGet(reg, m.requestSize).(*prometheus.HistogramVec)
 		m.requestDuration = util.MustRegisterOrGet(reg, m.requestDuration).(*prometheus.HistogramVec)
 		m.batchRetries = util.MustRegisterOrGet(reg, m.batchRetries).(*prometheus.CounterVec)
 	}
@@ -95,12 +106,12 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 	return &m
 }
 
-type WALClientMetrics struct {
+type walEndpointMetrics struct {
 	lastReadTimestamp *prometheus.GaugeVec
 }
 
-func NewWALClientMetrics(reg prometheus.Registerer) *WALClientMetrics {
-	m := &WALClientMetrics{
+func newWALEndpointMetrics(reg prometheus.Registerer) *walEndpointMetrics {
+	m := &walEndpointMetrics{
 		lastReadTimestamp: prometheus.NewGaugeVec(
 			prometheus.GaugeOpts{
 				Namespace: "loki_write",
@@ -118,8 +129,8 @@ func NewWALClientMetrics(reg prometheus.Registerer) *WALClientMetrics {
 	return m
 }
 
-func (m *WALClientMetrics) CurryWithId(id string) *WALClientMetrics {
-	return &WALClientMetrics{
+func (m *walEndpointMetrics) CurryWithId(id string) *walEndpointMetrics {
+	return &walEndpointMetrics{
 		lastReadTimestamp: m.lastReadTimestamp.MustCurryWith(map[string]string{
 			"id": id,
 		}),

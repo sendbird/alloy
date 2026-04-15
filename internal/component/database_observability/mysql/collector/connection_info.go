@@ -2,8 +2,8 @@ package collector
 
 import (
 	"context"
+	"database/sql"
 	"net"
-	"regexp"
 	"strings"
 
 	"github.com/go-sql-driver/mysql"
@@ -14,16 +14,12 @@ import (
 
 const ConnectionInfoName = "connection_info"
 
-var (
-	rdsRegex   = regexp.MustCompile(`(?P<identifier>[^\.]+)\.([^\.]+)\.(?P<region>[^\.]+)\.rds\.amazonaws\.com`)
-	azureRegex = regexp.MustCompile(`(?P<identifier>[^\.]+)\.mysql\.database\.azure\.com`)
-)
-
 type ConnectionInfoArguments struct {
 	DSN           string
 	Registry      *prometheus.Registry
 	EngineVersion string
 	CloudProvider *database_observability.CloudProvider
+	DB            *sql.DB
 }
 
 type ConnectionInfo struct {
@@ -32,8 +28,10 @@ type ConnectionInfo struct {
 	EngineVersion string
 	InfoMetric    *prometheus.GaugeVec
 	CloudProvider *database_observability.CloudProvider
+	dbConnection  *sql.DB
 
 	running *atomic.Bool
+	stop    func()
 }
 
 func NewConnectionInfo(args ConnectionInfoArguments) (*ConnectionInfo, error) {
@@ -51,6 +49,7 @@ func NewConnectionInfo(args ConnectionInfoArguments) (*ConnectionInfo, error) {
 		EngineVersion: args.EngineVersion,
 		InfoMetric:    infoMetric,
 		CloudProvider: args.CloudProvider,
+		dbConnection:  args.DB,
 		running:       &atomic.Bool{},
 	}, nil
 }
@@ -81,7 +80,15 @@ func (c *ConnectionInfo) Start(ctx context.Context) error {
 		}
 		if c.CloudProvider.Azure != nil {
 			providerName = "azure"
-			dbInstanceIdentifier = c.CloudProvider.Azure.Resource
+			dbInstanceIdentifier = c.CloudProvider.Azure.ServerName
+			providerRegion = c.CloudProvider.Azure.ResourceGroup
+			providerAccount = c.CloudProvider.Azure.SubscriptionID
+		}
+		if c.CloudProvider.GCP != nil {
+			providerName = "gcp"
+			providerRegion = c.CloudProvider.GCP.Region
+			providerAccount = c.CloudProvider.GCP.ProjectID
+			dbInstanceIdentifier = c.CloudProvider.GCP.InstanceID
 		}
 	} else {
 		cfg, err := mysql.ParseDSN(c.DSN)
@@ -93,14 +100,14 @@ func (c *ConnectionInfo) Start(ctx context.Context) error {
 		if err == nil && host != "" {
 			if strings.HasSuffix(host, "rds.amazonaws.com") {
 				providerName = "aws"
-				matches := rdsRegex.FindStringSubmatch(host)
+				matches := database_observability.RdsRegex.FindStringSubmatch(host)
 				if len(matches) > 3 {
 					dbInstanceIdentifier = matches[1]
 					providerRegion = matches[3]
 				}
 			} else if strings.HasSuffix(host, "mysql.database.azure.com") {
 				providerName = "azure"
-				matches := azureRegex.FindStringSubmatch(host)
+				matches := database_observability.AzureMySQLRegex.FindStringSubmatch(host)
 				if len(matches) > 1 {
 					dbInstanceIdentifier = matches[1]
 				}
@@ -109,7 +116,21 @@ func (c *ConnectionInfo) Start(ctx context.Context) error {
 	}
 	c.running.Store(true)
 
-	c.InfoMetric.WithLabelValues(providerName, providerRegion, providerAccount, dbInstanceIdentifier, engine, c.EngineVersion).Set(1)
+	labelValues := []string{providerName, providerRegion, providerAccount, dbInstanceIdentifier, engine, c.EngineVersion}
+	c.InfoMetric.WithLabelValues(labelValues...).Set(1)
+
+	if c.dbConnection != nil {
+		c.stop = database_observability.RunConnectionInfoMonitor(
+			ctx,
+			c.dbConnection,
+			c.Registry,
+			c.InfoMetric,
+			labelValues,
+			func() { c.running.Store(false) },
+			nil,
+		)
+	}
+
 	return nil
 }
 
@@ -118,6 +139,9 @@ func (c *ConnectionInfo) Stopped() bool {
 }
 
 func (c *ConnectionInfo) Stop() {
+	if c.stop != nil {
+		c.stop()
+	}
 	c.Registry.Unregister(c.InfoMetric)
 	c.running.Store(false)
 }

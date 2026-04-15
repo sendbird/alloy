@@ -63,11 +63,10 @@ func toKafkaReceiver(state *State, id componentstatus.InstanceID, cfg *kafkarece
 		ProtocolVersion:   cfg.ProtocolVersion,
 		SessionTimeout:    cfg.SessionTimeout,
 		HeartbeatInterval: cfg.HeartbeatInterval,
-		Topic:             cfg.Topic,
-		Encoding:          cfg.Encoding,
 		GroupID:           cfg.GroupID,
 		ClientID:          cfg.ClientID,
 		InitialOffset:     cfg.InitialOffset,
+		ConnIdleTimeout:   cfg.ConnIdleTimeout,
 
 		ResolveCanonicalBootstrapServersOnly: cfg.ResolveCanonicalBootstrapServersOnly,
 
@@ -84,13 +83,12 @@ func toKafkaReceiver(state *State, id componentstatus.InstanceID, cfg *kafkarece
 		Traces:  toKafkaTopicEncodingConfig(cfg.Traces),
 
 		MinFetchSize:           cfg.MinFetchSize,
-		DefaultFetchSize:       cfg.DefaultFetchSize,
 		MaxFetchSize:           cfg.MaxFetchSize,
 		MaxPartitionFetchSize:  cfg.MaxPartitionFetchSize,
 		MaxFetchWait:           cfg.MaxFetchWait,
 		RackID:                 cfg.RackID,
 		UseLeaderEpoch:         cfg.UseLeaderEpoch,
-		GroupRebalanceStrategy: cfg.GroupRebalanceStrategy,
+		GroupRebalanceStrategy: string(cfg.GroupRebalanceStrategy),
 		GroupInstanceID:        cfg.GroupInstanceID,
 
 		ErrorBackOff: toKafkaErrorBackOff(cfg.ErrorBackOff),
@@ -116,10 +114,11 @@ func toKafkaErrorBackOff(cfg configretry.BackOffConfig) kafka.ErrorBackOffArgume
 	}
 }
 
-func toKafkaTopicEncodingConfig(cfg kafkareceiver.TopicEncodingConfig) *kafka.KafkaReceiverTopicEncodingConfig {
-	return &kafka.KafkaReceiverTopicEncodingConfig{
-		Topic:    cfg.Topic,
-		Encoding: cfg.Encoding,
+func toKafkaTopicEncodingConfig(cfg kafkareceiver.TopicEncodingConfig) kafka.KafkaReceiverTopicEncodingConfig {
+	return kafka.KafkaReceiverTopicEncodingConfig{
+		Topics:        cfg.Topics,
+		Encoding:      cfg.Encoding,
+		ExcludeTopics: cfg.ExcludeTopics,
 	}
 }
 

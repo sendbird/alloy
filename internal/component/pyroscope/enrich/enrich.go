@@ -5,12 +5,13 @@ import (
 	"context"
 	"sync"
 
-	"github.com/prometheus/prometheus/model/labels"
-
 	"github.com/grafana/alloy/internal/component"
 	"github.com/grafana/alloy/internal/component/discovery"
 	"github.com/grafana/alloy/internal/component/pyroscope"
+	"github.com/grafana/alloy/internal/component/pyroscope/write/debuginfo"
 	"github.com/grafana/alloy/internal/featuregate"
+	"github.com/grafana/pyroscope/api/gen/proto/go/debuginfo/v1alpha1/debuginfov1alpha1connect"
+	"github.com/prometheus/prometheus/model/labels"
 )
 
 func init() {
@@ -199,4 +200,12 @@ func (c *Component) Update(args component.Arguments) error {
 
 func (c *Component) Exports() component.Exports {
 	return &c.exports
+}
+
+func (e *enrichAppendable) Upload(j debuginfo.UploadJob) {
+	e.component.fanout.Upload(j)
+}
+
+func (e *enrichAppendable) DebugInfoClients() []debuginfov1alpha1connect.DebuginfoServiceClient {
+	return e.component.fanout.DebugInfoClients()
 }

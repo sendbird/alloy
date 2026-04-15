@@ -7,6 +7,8 @@ import (
 	"testing"
 
 	"github.com/google/pprof/profile"
+	"github.com/grafana/alloy/internal/component/pyroscope/ebpf/discovery"
+	"github.com/grafana/alloy/internal/component/pyroscope/ebpf/symb/irsymcache"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/ebpf-profiler/libpf/pfelf"
@@ -14,20 +16,23 @@ import (
 	"go.opentelemetry.io/ebpf-profiler/libpf"
 	"go.opentelemetry.io/ebpf-profiler/reporter/samples"
 	"go.opentelemetry.io/ebpf-profiler/support"
-
-	discovery "go.opentelemetry.io/ebpf-profiler/pyroscope/discovery"
-	"go.opentelemetry.io/ebpf-profiler/pyroscope/symb/irsymcache"
 )
 
 func singleFrameTrace(ty libpf.FrameType, mappingFile libpf.FrameMappingFile, lineno libpf.AddressOrLineno, funcName, sourceFile string, sourceLine libpf.SourceLineno) libpf.Frames {
 	frames := make(libpf.Frames, 0, 1)
+	var mapping libpf.FrameMapping
+	if mappingFile != (libpf.FrameMappingFile{}) {
+		mapping = libpf.NewFrameMapping(libpf.FrameMappingData{
+			File: mappingFile,
+		})
+	}
 	frames.Append(&libpf.Frame{
 		Type:            ty,
 		AddressOrLineno: lineno,
 		FunctionName:    libpf.Intern(funcName),
 		SourceFile:      libpf.Intern(sourceFile),
 		SourceLine:      sourceLine,
-		MappingFile:     mappingFile,
+		Mapping:         mapping,
 	})
 	return frames
 }
@@ -44,10 +49,12 @@ func newReporter() *PPROFReporter {
 	return NewPPROF(
 		nil,
 		&Config{
-			SamplesPerSecond:          97,
-			ExtraNativeSymbolResolver: nil,
+			SamplesPerSecond: 97,
+			KernelFrames:     true,
 		},
 		tp,
+		nil,
+		nil,
 	)
 }
 
@@ -61,11 +68,8 @@ func TestPPROFReporter_StringAndFunctionTablePopulation(t *testing.T) {
 		FileName: libpf.Intern(filePath),
 	})
 
-	traceKey := samples.TraceAndMetaKey{
-		Pid: 123,
-	}
-	events := samples.KeyToEventMapping{
-		traceKey: &samples.TraceEvents{
+	events := samples.SampleToEvents{
+		{}: &samples.TraceEvents{
 			Frames: singleFrameTrace(libpf.PythonFrame, mappingFile, 0x30,
 				funcName, filePath, 1234),
 			Timestamps: []uint64{42},
@@ -73,7 +77,7 @@ func TestPPROFReporter_StringAndFunctionTablePopulation(t *testing.T) {
 	}
 
 	profiles := rep.createProfile(
-		samples.ContainerID(""),
+		samples.ResourceKey{PID: 123},
 		support.TraceOriginSampling,
 		events,
 	)
@@ -101,12 +105,14 @@ Mappings
 func singleFrameNative(mappingFile libpf.FrameMappingFile, lineno libpf.AddressOrLineno, mappingStart, mappingEnd libpf.Address, mappingFileOffset uint64) libpf.Frames {
 	frames := make(libpf.Frames, 0, 2)
 	frames.Append(&libpf.Frame{
-		Type:              libpf.NativeFrame,
-		AddressOrLineno:   lineno,
-		MappingStart:      mappingStart,
-		MappingEnd:        mappingEnd,
-		MappingFileOffset: mappingFileOffset,
-		MappingFile:       mappingFile,
+		Type:            libpf.NativeFrame,
+		AddressOrLineno: lineno,
+		Mapping: libpf.NewFrameMapping(libpf.FrameMappingData{
+			File:       mappingFile,
+			Start:      mappingStart,
+			End:        mappingEnd,
+			FileOffset: mappingFileOffset,
+		}),
 	})
 	return frames
 }
@@ -120,17 +126,14 @@ func TestPPROFReporter_NativeFrame(t *testing.T) {
 		FileName: libpf.Intern(filePath),
 	})
 
-	traceKey := samples.TraceAndMetaKey{
-		Pid: 123,
-	}
-	events := samples.KeyToEventMapping{
-		traceKey: &samples.TraceEvents{
+	events := samples.SampleToEvents{
+		{}: &samples.TraceEvents{
 			Frames:     singleFrameNative(mappingFile, 0x1000, 0x1000, 0x2000, 0x100),
 			Timestamps: []uint64{789},
 		},
 	}
 	profiles := rep.createProfile(
-		samples.ContainerID(""),
+		samples.ResourceKey{PID: 123},
 		support.TraceOriginSampling,
 		events,
 	)
@@ -163,18 +166,15 @@ func TestPPROFReporter_WithoutMapping(t *testing.T) {
 		AddressOrLineno: 0x2000,
 	})
 
-	traceKey := samples.TraceAndMetaKey{
-		Pid: 123,
-	}
-	events := samples.KeyToEventMapping{
-		traceKey: &samples.TraceEvents{
+	events := samples.SampleToEvents{
+		{}: &samples.TraceEvents{
 			Frames:     frames,
 			Timestamps: []uint64{42},
 		},
 	}
 
 	profiles := rep.createProfile(
-		samples.ContainerID(""),
+		samples.ResourceKey{PID: 123},
 		support.TraceOriginSampling,
 		events,
 	)
@@ -222,18 +222,15 @@ func TestPPROFReporter_Bug(t *testing.T) {
 		SourceLine:   240,
 	})
 
-	traceKey := samples.TraceAndMetaKey{
-		Pid: 123,
-	}
-	events := samples.KeyToEventMapping{
-		traceKey: &samples.TraceEvents{
+	events := samples.SampleToEvents{
+		{}: &samples.TraceEvents{
 			Frames:     frames,
 			Timestamps: []uint64{42},
 		},
 	}
 
 	profiles := rep.createProfile(
-		samples.ContainerID(""),
+		samples.ResourceKey{PID: 123},
 		support.TraceOriginSampling,
 		events,
 	)
@@ -267,7 +264,7 @@ func TestPPROFReporter_Demangle(t *testing.T) {
 		addr: 0xcafe00de,
 	}
 	rep := newReporter()
-	rep.cfg.ExtraNativeSymbolResolver = &symbolizer{
+	rep.symbols = &symbolizer{
 		symbols: map[symbolizerKey]irsymcache.SourceInfo{
 			key: {
 				LineNumber:   9,
@@ -290,37 +287,38 @@ func TestPPROFReporter_Demangle(t *testing.T) {
 		Type:            libpf.NativeFrame,
 		FunctionName:    libpf.Intern("_ZN18ConcurrentGCThread3runEv"),
 		AddressOrLineno: 0xcafe00ef,
-		MappingStart:    0xcafe0000,
-		MappingEnd:      0xcafe1000,
-		MappingFile: libpf.NewFrameMappingFile(libpf.FrameMappingFileData{
-			FileID:   fid,
-			FileName: libpf.Intern("libfoo.so"),
+		Mapping: libpf.NewFrameMapping(libpf.FrameMappingData{
+			File: libpf.NewFrameMappingFile(libpf.FrameMappingFileData{
+				FileID:   fid,
+				FileName: libpf.Intern("libfoo.so"),
+			}),
+			Start: 0xcafe0000,
+			End:   0xcafe1000,
 		}),
 	})
 	frames.Append(&libpf.Frame{ // a native frame with a mapping should be symbolized
 		Type:            libpf.NativeFrame,
 		FunctionName:    libpf.NullString,
 		AddressOrLineno: 0xcafe00de,
-		MappingStart:    0xcafe0000,
-		MappingEnd:      0xcafe1000,
-		MappingFile: libpf.NewFrameMappingFile(libpf.FrameMappingFileData{
-			FileID:   fid,
-			FileName: libpf.Intern("libfoo.so"),
+		Mapping: libpf.NewFrameMapping(libpf.FrameMappingData{
+			File: libpf.NewFrameMappingFile(libpf.FrameMappingFileData{
+				FileID:   fid,
+				FileName: libpf.Intern("libfoo.so"),
+			}),
+			Start: 0xcafe0000,
+			End:   0xcafe1000,
 		}),
 	})
 
-	traceKey := samples.TraceAndMetaKey{
-		Pid: 123,
-	}
-	events := samples.KeyToEventMapping{
-		traceKey: &samples.TraceEvents{
+	events := samples.SampleToEvents{
+		{}: &samples.TraceEvents{
 			Frames:     frames,
 			Timestamps: []uint64{42},
 		},
 	}
 
 	profiles := rep.createProfile(
-		samples.ContainerID(""),
+		samples.ResourceKey{PID: 123},
 		support.TraceOriginSampling,
 		events,
 	)
@@ -350,7 +348,7 @@ Mappings
 
 func TestPPROFReporter_UnsymbolizedStub(t *testing.T) {
 	rep := newReporter()
-	rep.cfg.ExtraNativeSymbolResolver = &symbolizer{}
+	rep.symbols = &symbolizer{}
 	rep.cfg.ReporterUnsymbolizedStubs = true
 
 	frames := make(libpf.Frames, 0, 1)
@@ -365,26 +363,25 @@ func TestPPROFReporter_UnsymbolizedStub(t *testing.T) {
 	frames.Append(&libpf.Frame{
 		Type:            libpf.NativeFrame,
 		AddressOrLineno: 0xcafe00ef,
-		MappingStart:    0xcafe0000,
-		MappingEnd:      0xcafe1000,
-		MappingFile: libpf.NewFrameMappingFile(libpf.FrameMappingFileData{
-			FileID:   libpf.NewFileID(7, 13),
-			FileName: libpf.Intern("libfoo.so"),
+		Mapping: libpf.NewFrameMapping(libpf.FrameMappingData{
+			File: libpf.NewFrameMappingFile(libpf.FrameMappingFileData{
+				FileID:   libpf.NewFileID(7, 13),
+				FileName: libpf.Intern("libfoo.so"),
+			}),
+			Start: 0xcafe0000,
+			End:   0xcafe1000,
 		}),
 	})
 
-	traceKey := samples.TraceAndMetaKey{
-		Pid: 123,
-	}
-	events := samples.KeyToEventMapping{
-		traceKey: &samples.TraceEvents{
+	events := samples.SampleToEvents{
+		{}: &samples.TraceEvents{
 			Frames:     frames,
 			Timestamps: []uint64{42},
 		},
 	}
 
 	profiles := rep.createProfile(
-		samples.ContainerID(""),
+		samples.ResourceKey{PID: 123},
 		support.TraceOriginSampling,
 		events,
 	)

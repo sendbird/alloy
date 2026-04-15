@@ -81,6 +81,8 @@ Refer to the upstream receiver [documentation](https://github.com/open-telemetry
 
 You can use the following blocks with `otelcol.receiver.awss3`:
 
+{{< docs/alloy-config >}}
+
 | Block                          | Description                                                                  | Required                                  |
 | ------------------------------ | ---------------------------------------------------------------------------- | ----------------------------------------- |
 | [`s3downloader`][s3downloader] | Configures S3 downloader.                                                    | yes                                       |
@@ -90,6 +92,8 @@ You can use the following blocks with `otelcol.receiver.awss3`:
 [s3downloader]: #s3downloader
 [sqs]: #sqs
 [output]: #output
+
+{{< /docs/alloy-config >}}
 
 ### `s3downloader`
 
@@ -108,9 +112,11 @@ The following arguments are supported:
 | `file_prefix`           | `string` | Prefix used to filter files for download.                                                             |               | no       |
 | `region`                | `string` | AWS region.                                                                                           | `"us-east-1"` | no       |
 | `s3_force_path_style`   | `bool`   | When enabled, forces the request to use [path-style addressing][s3-force-path-style-ref].             | `false`       | no       |
-| `s3_partition`          | `string` | Time granularity of S3 key: hour or minute.                                                           | `"minute"`    | no       |
+| `s3_partition_format`   | `string` | Format for the partition key. See [strftime][] for format specification.                              | `"year=%Y/month=%m/day=%d/hour=%H/minute=%M"` | no       |
+| `s3_partition_timezone` | `string` | IANA timezone name applied when formatting the partition key.                                         | Local time    | no       |
 
 [s3-force-path-style-ref]: http://docs.aws.amazon.com/AmazonS3/latest/dev/VirtualHosting.html
+[strftime]: https://www.man7.org/linux/man-pages/man3/strftime.3.html
 
 ### `sqs`
 
@@ -191,13 +197,13 @@ otelcol.receiver.awss3 "sqs_traces" {
 
 otelcol.processor.batch "default" {
   output {
-    metrics = [otelcol.exporter.otlp.default.input]
-    logs    = [otelcol.exporter.otlp.default.input]
-    traces  = [otelcol.exporter.otlp.default.input]
+    metrics = [otelcol.exporter.otlphttp.default.input]
+    logs    = [otelcol.exporter.otlphttp.default.input]
+    traces  = [otelcol.exporter.otlphttp.default.input]
   }
 }
 
-otelcol.exporter.otlp "default" {
+otelcol.exporter.otlphttp "default" {
   client {
     endpoint = sys.env("<OTLP_ENDPOINT>")
   }

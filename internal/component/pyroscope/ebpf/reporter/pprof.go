@@ -7,20 +7,21 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"sync"
 	"time"
 
-	"github.com/grafana/alloy/internal/runtime/logging/level"
-
 	"github.com/go-kit/log"
+	"github.com/go-kit/log/level"
 	"github.com/google/pprof/profile"
+	"github.com/grafana/alloy/internal/component/pyroscope/ebpf/discovery"
+	"github.com/grafana/alloy/internal/component/pyroscope/ebpf/reporter/args"
+	"github.com/grafana/alloy/internal/component/pyroscope/ebpf/symb/irsymcache"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/model/labels"
 	"go.opentelemetry.io/ebpf-profiler/libpf"
 	"go.opentelemetry.io/ebpf-profiler/libpf/xsync"
 	"go.opentelemetry.io/ebpf-profiler/process"
-	"go.opentelemetry.io/ebpf-profiler/pyroscope/discovery"
-	"go.opentelemetry.io/ebpf-profiler/pyroscope/symb/irsymcache"
 	"go.opentelemetry.io/ebpf-profiler/reporter/samples"
 	"go.opentelemetry.io/ebpf-profiler/support"
 )
@@ -30,40 +31,38 @@ type PPROF struct {
 	Labels labels.Labels
 	Origin libpf.Origin
 }
-type PPROFConsumer interface {
-	ConsumePprofProfiles(ctx context.Context, p []PPROF)
-}
 
-type PPROFConsumerFunc func(ctx context.Context, p []PPROF)
-
-func (f PPROFConsumerFunc) ConsumePprofProfiles(ctx context.Context, p []PPROF) {
-	f(ctx, p)
-}
+type PPROFConsumer func(ctx context.Context, p []PPROF)
 
 type Config struct {
 	ReportInterval            time.Duration
 	SamplesPerSecond          int64
 	Demangle                  string
 	ReporterUnsymbolizedStubs bool
-
-	ExtraNativeSymbolResolver irsymcache.NativeSymbolResolver
-	Consumer                  PPROFConsumer
+	PIDLabel                  bool
+	CommMode                  args.CommMode
+	KernelFrames              bool
 }
 type PPROFReporter struct {
 	cfg *Config
 	log log.Logger
 
+	consumer PPROFConsumer
+	symbols  irsymcache.NativeSymbolResolver
+
 	traceEvents xsync.RWMutex[samples.TraceEventsTree]
 
-	sd              discovery.TargetProducer
+	sd discovery.TargetProducer
+
 	wg              sync.WaitGroup
 	cancelReporting context.CancelFunc
 }
 
-func NewPPROF(
-	log log.Logger,
+func NewPPROF(log log.Logger,
 	cfg *Config,
 	sd discovery.TargetProducer,
+	symbols irsymcache.NativeSymbolResolver,
+	consumer PPROFConsumer,
 ) *PPROFReporter {
 
 	tree := make(samples.TraceEventsTree)
@@ -72,6 +71,8 @@ func NewPPROF(
 		log:         log,
 		traceEvents: xsync.NewRWMutex(tree),
 		sd:          sd,
+		consumer:    consumer,
+		symbols:     symbols,
 	}
 }
 
@@ -81,47 +82,50 @@ func (p *PPROFReporter) ReportTraceEvent(trace *libpf.Trace, meta *samples.Trace
 	switch meta.Origin {
 	case support.TraceOriginSampling:
 	case support.TraceOriginOffCPU:
-	case support.TraceOriginUProbe:
+	case support.TraceOriginProbe:
 	default:
 		return fmt.Errorf("skip reporting trace for %d origin: %w", meta.Origin,
 			errUnknownOrigin)
 	}
 
-	containerID := meta.ContainerID
-	key := samples.TraceAndMetaKey{
-		Hash:           trace.Hash,
-		Comm:           meta.Comm,
-		ProcessName:    meta.ProcessName,
+	key := samples.ResourceKey{
+		APMServiceName: meta.APMServiceName,
+		ContainerID:    meta.ContainerID,
+		PID:            int64(meta.PID),
 		ExecutablePath: meta.ExecutablePath,
-		ApmServiceName: meta.APMServiceName,
-		Pid:            int64(meta.PID),
-		Tid:            int64(meta.TID),
 	}
 
 	eventsTree := p.traceEvents.WLock()
 	defer p.traceEvents.WUnlock(&eventsTree)
 
-	if _, exists := (*eventsTree)[samples.ContainerID(containerID)]; !exists {
-		(*eventsTree)[samples.ContainerID(containerID)] =
-			make(map[libpf.Origin]samples.KeyToEventMapping)
+	if _, exists := (*eventsTree)[key]; !exists {
+		(*eventsTree)[key] = samples.ResourceToProfiles{
+			EnvVars: meta.EnvVars,
+			Events:  make(map[libpf.Origin]samples.SampleToEvents),
+		}
 	}
 
-	if _, exists := (*eventsTree)[samples.ContainerID(containerID)][meta.Origin]; !exists {
-		(*eventsTree)[samples.ContainerID(containerID)][meta.Origin] =
-			make(samples.KeyToEventMapping)
+	rtp := (*eventsTree)[key]
+	if _, exists := rtp.Events[meta.Origin]; !exists {
+		rtp.Events[meta.Origin] = make(samples.SampleToEvents)
 	}
 
-	if events, exists := (*eventsTree)[samples.ContainerID(containerID)][meta.Origin][key]; exists {
+	sampleKey := samples.SampleKey{
+		Hash: trace.Hash,
+		Comm: meta.Comm,
+		TID:  int64(meta.TID),
+		CPU:  int64(meta.CPU),
+	}
+	if events, exists := rtp.Events[meta.Origin][sampleKey]; exists {
 		events.Timestamps = append(events.Timestamps, uint64(meta.Timestamp))
 		events.OffTimes = append(events.OffTimes, meta.OffTime)
-		(*eventsTree)[samples.ContainerID(containerID)][meta.Origin][key] = events
 		return nil
 	}
-	(*eventsTree)[samples.ContainerID(containerID)][meta.Origin][key] = &samples.TraceEvents{
+
+	rtp.Events[meta.Origin][sampleKey] = &samples.TraceEvents{
 		Frames:     trace.Frames,
 		Timestamps: []uint64{uint64(meta.Timestamp)},
 		OffTimes:   []int64{meta.OffTime},
-		EnvVars:    meta.EnvVars,
 		Labels:     trace.CustomLabels,
 	}
 	return nil
@@ -163,14 +167,14 @@ func (p *PPROFReporter) reportProfile(ctx context.Context) {
 	*traceEventsPtr = newEvents
 	p.traceEvents.WUnlock(&traceEventsPtr)
 	var profiles []PPROF
-	for containerID, ts := range reportedEvents {
-		for origin, events := range ts {
-			pp := p.createProfile(containerID, origin, events)
+	for resourceKey, rtp := range reportedEvents {
+		for origin, events := range rtp.Events {
+			pp := p.createProfile(resourceKey, origin, events)
 			profiles = append(profiles, pp...)
 		}
 	}
 
-	p.cfg.Consumer.ConsumePprofProfiles(ctx, profiles)
+	p.consumer(ctx, profiles)
 	sz := 0
 	for _, it := range profiles {
 		sz += len(it.Raw)
@@ -178,10 +182,10 @@ func (p *PPROFReporter) reportProfile(ctx context.Context) {
 	_ = level.Debug(p.log).Log("msg", "pprof report successful", "count", len(profiles), "total-size", sz)
 }
 
-func (p *PPROFReporter) createProfile(containerID samples.ContainerID, origin libpf.Origin, events map[samples.TraceAndMetaKey]*samples.TraceEvents) []PPROF {
+func (p *PPROFReporter) createProfile(resourceKey samples.ResourceKey, origin libpf.Origin, events map[samples.SampleKey]*samples.TraceEvents) []PPROF {
 	defer func() {
-		if p.cfg.ExtraNativeSymbolResolver != nil {
-			p.cfg.ExtraNativeSymbolResolver.Cleanup()
+		if p.symbols != nil {
+			p.symbols.Cleanup()
 		}
 	}()
 
@@ -191,15 +195,26 @@ func (p *PPROFReporter) createProfile(containerID samples.ContainerID, origin li
 		Origin:        origin,
 	})
 
-	for traceKey, traceInfo := range events {
-		target := p.sd.FindTarget(uint32(traceKey.Pid), string(containerID))
+	for sampleKey, traceInfo := range events {
+		target := p.sd.FindTarget(uint32(resourceKey.PID), resourceKey.ContainerID.String())
 		if target == nil {
 			continue
 		}
-		b := bs.BuilderForSample(target, uint32(traceKey.Pid))
+		b := bs.BuilderForSample(target, uint32(resourceKey.PID))
 		fakeMapping := b.FakeMapping()
 
 		s := b.NewSample(len(traceInfo.Frames))
+		comm := sampleKey.Comm.String()
+		sampleLabels := map[string][]string{}
+		if comm != "" && p.cfg.CommMode.Label() {
+			sampleLabels["comm"] = []string{comm}
+		}
+		if p.cfg.PIDLabel {
+			sampleLabels["pid"] = []string{strconv.FormatInt(resourceKey.PID, 10)}
+		}
+		if len(sampleLabels) > 0 {
+			s.Label = sampleLabels
+		}
 
 		switch origin {
 		case support.TraceOriginSampling:
@@ -210,24 +225,28 @@ func (p *PPROFReporter) createProfile(containerID samples.ContainerID, origin li
 				sum += t
 			}
 			b.AddValue(sum, s)
-		case support.TraceOriginUProbe:
+		case support.TraceOriginProbe:
 			b.AddValue(int64(len(traceInfo.Timestamps)), s)
 		}
 
 		for i := range traceInfo.Frames {
 			fr := traceInfo.Frames[i].Value()
+			if !p.cfg.KernelFrames && fr.Type == libpf.KernelFrame {
+				continue
+			}
 			var (
 				mapping  *profile.Mapping
 				location *profile.Location
 				fresh    bool
 			)
-			if fr.MappingFile.Valid() {
-				pfMapping := fr.MappingFile.Value()
-				mapping, fresh = b.Mapping(fr.MappingStart, fr.MappingFile)
+			if fr.Mapping.Valid() {
+				mappingData := fr.Mapping.Value()
+				pfMapping := mappingData.File.Value()
+				mapping, fresh = b.Mapping(mappingData.Start, mappingData.File)
 				if fresh {
-					mapping.Start = uint64(fr.MappingStart)
-					mapping.Limit = uint64(fr.MappingEnd)
-					mapping.Offset = fr.MappingFileOffset
+					mapping.Start = uint64(mappingData.Start)
+					mapping.Limit = uint64(mappingData.End)
+					mapping.Offset = mappingData.FileOffset
 					mapping.File = pfMapping.FileName.String()
 					mapping.BuildID = pfMapping.GnuBuildID
 				}
@@ -241,8 +260,8 @@ func (p *PPROFReporter) createProfile(containerID samples.ContainerID, origin li
 				location.Address = uint64(fr.AddressOrLineno)
 				switch fr.Type {
 				case libpf.NativeFrame:
+					p.symbolizeNativeFrame(b, location, fr)
 					if fr.FunctionName == libpf.NullString {
-						p.symbolizeNativeFrame(b, location, fr)
 						if location.Line == nil && p.cfg.ReporterUnsymbolizedStubs {
 							p.symbolizeStub(b, location, fr)
 						}
@@ -256,18 +275,18 @@ func (p *PPROFReporter) createProfile(containerID samples.ContainerID, origin li
 						location.Mapping.HasFunctions = true
 					}
 
-				case libpf.AbortFrame:
-					// Be explicit about unknown frames so that we do introduce unknown unknowns.
-					location.Line = []profile.Line{{
-						Line: 0,
-						Function: b.Function(
-							libpf.Intern("[unknown]"),
-							libpf.Intern("[unknown]"),
-						)},
-					}
-					location.Mapping.HasFunctions = true
 				default:
-					if fr.FunctionName != libpf.NullString {
+					if fr.Type.IsAbort() {
+						// Be explicit about unknown frames so that we do introduce unknown unknowns.
+						location.Line = []profile.Line{{
+							Line: 0,
+							Function: b.Function(
+								libpf.Intern("[unknown]"),
+								libpf.Intern("[unknown]"),
+							)},
+						}
+						location.Mapping.HasFunctions = true
+					} else if fr.FunctionName != libpf.NullString {
 						location.Line = []profile.Line{{
 							Line: int64(fr.SourceLine),
 							Function: b.Function(
@@ -284,6 +303,9 @@ func (p *PPROFReporter) createProfile(containerID samples.ContainerID, origin li
 				continue
 			}
 			s.Location = append(s.Location, location)
+		}
+		if comm != "" && p.cfg.CommMode.Stackframe() {
+			s.Location = append(s.Location, b.CommLocation(comm))
 		}
 	}
 	res := make([]PPROF, 0, len(bs.Builders))
@@ -321,17 +343,17 @@ func (p *PPROFReporter) symbolizeNativeFrame(
 	fr libpf.Frame,
 ) {
 
-	if !fr.MappingFile.Valid() {
+	if !fr.Mapping.Valid() {
 		return
 	}
-	mappingFile := fr.MappingFile.Value()
+	mappingFile := fr.Mapping.Value().File.Value()
 	if mappingFile.FileName == process.VdsoPathName {
 		return
 	}
-	if p.cfg.ExtraNativeSymbolResolver == nil {
+	if p.symbols == nil {
 		return
 	}
-	irsymcache.SymbolizeNativeFrame(p.cfg.ExtraNativeSymbolResolver, mappingFile.FileName, fr.AddressOrLineno, mappingFile.FileID, func(si irsymcache.SourceInfo) {
+	irsymcache.SymbolizeNativeFrame(p.symbols, mappingFile.FileName, fr.AddressOrLineno, mappingFile.FileID, func(si irsymcache.SourceInfo) {
 		name := si.FunctionName
 		if name == libpf.NullString && si.FilePath == libpf.NullString {
 			return

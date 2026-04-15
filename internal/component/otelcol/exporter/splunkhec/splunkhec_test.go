@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/splunkhecexporter"
+	translator "github.com/open-telemetry/opentelemetry-collector-contrib/pkg/translator/splunk"
 
 	"github.com/grafana/alloy/internal/component/otelcol/exporter/splunkhec/config"
 	"github.com/grafana/alloy/syntax"
@@ -51,11 +52,10 @@ func TestConfigConversion(t *testing.T) {
 			DisableKeepAlives:    false,
 			HTTP2ReadIdleTimeout: 0,
 			HTTP2PingTimeout:     0,
-			Cookies:              confighttp.CookiesConfig{},
+			Cookies:              configoptional.None[confighttp.CookiesConfig](),
 			ForceAttemptHTTP2:    true,
 		},
-		QueueSettings: exporterhelper.QueueBatchConfig{
-			Enabled:      true,
+		QueueSettings: configoptional.Some(exporterhelper.QueueBatchConfig{
 			NumConsumers: 10,
 			QueueSize:    1000,
 			StorageID:    nil,
@@ -66,7 +66,7 @@ func TestConfigConversion(t *testing.T) {
 				MinSize:      500,
 				MaxSize:      1000,
 			}),
-		},
+		}),
 		BackOffConfig: configretry.BackOffConfig{
 			Enabled:             true,
 			InitialInterval:     15 * time.Second,
@@ -88,7 +88,7 @@ func TestConfigConversion(t *testing.T) {
 		MaxEventSize:            0x500000,
 		SplunkAppName:           "Alloy",
 		SplunkAppVersion:        "",
-		HecFields:               splunkhecexporter.OtelToHecFields{SeverityText: "", SeverityNumber: ""},
+		HecFields:               translator.OtelToHecFields{SeverityText: "", SeverityNumber: ""},
 		HealthPath:              "/services/collector/health",
 		HecHealthCheckEnabled:   false,
 		ExportRaw:               false,
@@ -141,15 +141,14 @@ func TestConfigConversion(t *testing.T) {
 			HTTP2ReadIdleTimeout: 0,
 			HTTP2PingTimeout:     0,
 			ForceAttemptHTTP2:    true,
-			Cookies:              confighttp.CookiesConfig{}},
-		QueueSettings: exporterhelper.QueueBatchConfig{
-			Enabled:      true,
+			Cookies:              configoptional.None[confighttp.CookiesConfig](),
+		},
+		QueueSettings: configoptional.Some(exporterhelper.QueueBatchConfig{
 			NumConsumers: 10,
 			QueueSize:    1000,
-			StorageID:    (nil),
 			Sizer:        exporterhelper.RequestSizerTypeRequests,
 			Batch:        exporterhelper.NewDefaultQueueConfig().Batch,
-		},
+		}),
 		BackOffConfig: configretry.BackOffConfig{
 			Enabled:             true,
 			InitialInterval:     5 * time.Second,
@@ -173,7 +172,7 @@ func TestConfigConversion(t *testing.T) {
 		MaxContentLengthTraces:  0x200000,
 		MaxEventSize:            0x500000,
 		SplunkAppName:           "Alloy",
-		HecFields:               splunkhecexporter.OtelToHecFields{SeverityText: "", SeverityNumber: ""},
+		HecFields:               translator.OtelToHecFields{SeverityText: "", SeverityNumber: ""},
 		HealthPath:              "/services/collector/health", HecHealthCheckEnabled: false,
 		ExportRaw:            false,
 		UseMultiMetricFormat: false,

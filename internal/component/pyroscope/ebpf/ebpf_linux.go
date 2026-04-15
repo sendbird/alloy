@@ -4,8 +4,11 @@ package ebpf
 
 import (
 	"context"
+	"fmt"
 	"os"
+	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -13,21 +16,30 @@ import (
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
-	"github.com/grafana/alloy/internal/component"
-	"github.com/grafana/alloy/internal/component/pyroscope"
-	"github.com/grafana/alloy/internal/component/pyroscope/ebpf/reporter"
-	"github.com/grafana/alloy/internal/featuregate"
+	"github.com/grafana/alloy/internal/component/pyroscope/ebpf/symb/irsymcache"
 	"github.com/grafana/pyroscope/lidia"
 	"github.com/oklog/run"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/sirupsen/logrus"
+
 	"go.opentelemetry.io/ebpf-profiler/interpreter/python"
+	"go.opentelemetry.io/ebpf-profiler/libpf"
 	ebpfmetrics "go.opentelemetry.io/ebpf-profiler/metrics"
-	discovery2 "go.opentelemetry.io/ebpf-profiler/pyroscope/discovery"
+	"go.opentelemetry.io/ebpf-profiler/process"
 	"go.opentelemetry.io/ebpf-profiler/pyroscope/dynamicprofiling"
 	"go.opentelemetry.io/ebpf-profiler/pyroscope/internalshim/controller"
-	"go.opentelemetry.io/ebpf-profiler/pyroscope/symb/irsymcache"
-	metricnoop "go.opentelemetry.io/otel/metric/noop"
+
+	reporter2 "go.opentelemetry.io/ebpf-profiler/reporter"
+	sdkprometheus "go.opentelemetry.io/otel/exporters/prometheus"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+
+	"github.com/grafana/alloy/internal/component"
+	"github.com/grafana/alloy/internal/component/pyroscope"
+	alloydiscovery "github.com/grafana/alloy/internal/component/pyroscope/ebpf/discovery"
+	"github.com/grafana/alloy/internal/component/pyroscope/ebpf/reporter"
+	rargs "github.com/grafana/alloy/internal/component/pyroscope/ebpf/reporter/args"
+	"github.com/grafana/alloy/internal/component/pyroscope/write/debuginfo"
+	"github.com/grafana/alloy/internal/featuregate"
 )
 
 func init() {
@@ -38,44 +50,74 @@ func init() {
 
 		Build: func(opts component.Options, args component.Arguments) (component.Component, error) {
 			arguments := args.(Arguments)
+
 			return New(opts.Logger, opts.Registerer, opts.ID, arguments)
 		},
 	})
 	python.NoContinueWithNextUnwinder.Store(true)
-	// Disable ebpf profiler metrics
-	ebpfmetrics.Start(metricnoop.Meter{})
 }
 
+var (
+	ebpfMetricsOnce     sync.Once
+	ebpfMetricsRegistry *prometheus.Registry // reused by all instances
+	ebpfMetricsErr      error                // stored for all instances to check
+)
+
 func New(logger log.Logger, reg prometheus.Registerer, id string, args Arguments) (*Component, error) {
+	// ebpfmetrics.Start writes to package-level globals in the upstream library,
+	// so it must only be called once. All instances share the same OTel registry.
+	ebpfMetricsOnce.Do(func() {
+		ebpfMetricsRegistry = prometheus.NewRegistry()
+		promExporter, err := sdkprometheus.New(
+			sdkprometheus.WithRegisterer(ebpfMetricsRegistry),
+			sdkprometheus.WithoutTargetInfo(),
+		)
+		if err != nil {
+			ebpfMetricsErr = fmt.Errorf("creating OTel prometheus exporter: %w", err)
+			return
+		}
+		mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(promExporter))
+		ebpfmetrics.Start(mp.Meter("pyroscope.ebpf"))
+	})
+	if ebpfMetricsErr != nil {
+		return nil, ebpfMetricsErr
+	}
+	if reg != nil {
+		reg.MustRegister(ebpfMetricsRegistry)
+	}
+
 	cfg, err := args.Convert()
 	if err != nil {
 		return nil, err
 	}
 	dynamicProfilingPolicy := args.PyroscopeDynamicProfilingPolicy
-	discovery := discovery2.NewTargetProducer(args.targetsOptions(dynamicProfilingPolicy))
-	ms := newMetrics(reg)
+	discovery := alloydiscovery.NewTargetProducer(args.targetsOptions(dynamicProfilingPolicy))
 
 	appendable := pyroscope.NewFanout(args.ForwardTo, id, reg)
 
-	nfs, err := irsymcache.NewFSCache(irsymcache.TableTableFactory{
-		Options: []lidia.Option{
-			lidia.WithFiles(),
-			lidia.WithLines(),
-		},
-	}, irsymcache.Options{
-		SizeEntries: uint32(args.SymbCacheSizeEntries),
-		Path:        args.SymbCachePath,
-	})
-	if err != nil {
-		return nil, err
+	var nfs *irsymcache.Resolver
+	if args.SymbCacheEnabled {
+		nfs, err = irsymcache.NewFSCache(logger, irsymcache.TableTableFactory{
+			Options: []lidia.Option{
+				lidia.WithFiles(),
+				lidia.WithLines(),
+			},
+		}, irsymcache.Options{
+			SizeEntries: uint32(args.SymbCacheSizeEntries),
+			Path:        args.SymbCachePath,
+		})
+		if err != nil {
+			return nil, err
+		}
 	}
-	cfg.ExecutableReporter = nfs
 
 	if dynamicProfilingPolicy {
-		cfg.Policy = &dynamicprofiling.ServiceDiscoveryTargetsOnlyPolicy{Discovery: discovery}
+		cfg.Policy = &alloydiscovery.ServiceDiscoveryTargetsOnlyPolicy{Discovery: discovery}
 	} else {
 		cfg.Policy = dynamicprofiling.AlwaysOnPolicy{}
 	}
+
+	ms := newMetrics(reg)
 
 	res := &Component{
 		cfg:                    cfg,
@@ -86,18 +128,30 @@ func New(logger log.Logger, reg prometheus.Registerer, id string, args Arguments
 		targetFinder:           discovery,
 		dynamicProfilingPolicy: dynamicProfilingPolicy,
 		argsUpdate:             make(chan Arguments, 4),
+		symbols:                nfs,
 	}
 
-	cfg.Reporter = reporter.NewPPROF(logger, &reporter.Config{
+	var symbols irsymcache.NativeSymbolResolver
+	if nfs != nil {
+		symbols = nfs
+	}
+	r := reporter.NewPPROF(logger, &reporter.Config{
 		ReportInterval:            cfg.ReporterInterval,
 		SamplesPerSecond:          int64(cfg.SamplesPerSecond),
 		Demangle:                  args.Demangle,
 		ReporterUnsymbolizedStubs: args.ReporterUnsymbolizedStubs,
-		ExtraNativeSymbolResolver: nfs,
-		Consumer: reporter.PPROFConsumerFunc(func(ctx context.Context, ps []reporter.PPROF) {
+		PIDLabel:                  args.PIDLabel,
+		CommMode:                  rargs.CommMode(args.Comm),
+		KernelFrames:              args.KernelFrames,
+	}, discovery,
+		symbols,
+		func(ctx context.Context, ps []reporter.PPROF) {
 			res.sendProfiles(ctx, ps)
-		}),
-	}, discovery)
+		})
+
+	cfg.Reporter = r
+	cfg.ExecutableReporter = res
+
 	if cfg.VerboseMode {
 		logrus.SetLevel(logrus.DebugLevel)
 	}
@@ -111,13 +165,14 @@ type Component struct {
 	dynamicProfilingPolicy bool
 	argsUpdate             chan Arguments
 	appendable             *pyroscope.Fanout
-	targetFinder           discovery2.TargetProducer
+	targetFinder           alloydiscovery.TargetProducer
 
 	metrics *metrics
 	cfg     *controller.Config
 
 	healthMut sync.RWMutex
 	health    component.Health
+	symbols   *irsymcache.Resolver
 }
 
 func (c *Component) Run(ctx context.Context) error {
@@ -158,6 +213,7 @@ func (c *Component) Run(ctx context.Context) error {
 	}()
 
 	var g run.Group
+
 	g.Add(func() error {
 		for {
 			select {
@@ -252,6 +308,44 @@ func (c *Component) checkTraceFS() {
 	}
 }
 
+func (c *Component) ReportExecutable(md *reporter2.ExecutableMetadata) {
+	if md.MappingFile == (libpf.FrameMappingFile{}) {
+		return
+	}
+	if c.symbols != nil {
+		c.symbols.ReportExecutable(md)
+	}
+	if c.args.DebugInfoArguments.UploadEnabled {
+		c.reportExecutableForDebugInfoUpload(md)
+	}
+}
+
+func (c *Component) reportExecutableForDebugInfoUpload(args *reporter2.ExecutableMetadata) {
+	extractAsFile := func(pid libpf.PID, file string) string {
+		return path.Join("/proc", strconv.Itoa(int(pid)), "root", file)
+	}
+	mf := args.MappingFile.Value()
+	open := func() (process.ReadAtCloser, error) {
+		fallback := func() (process.ReadAtCloser, error) {
+			return args.Process.OpenMappingFile(args.Mapping)
+		}
+		if args.DebuglinkFileName == "" {
+			return fallback()
+		}
+		file := extractAsFile(args.Process.PID(), args.DebuglinkFileName)
+		if f, err := os.Open(file); err != nil {
+			return fallback()
+		} else {
+			return f, nil
+		}
+	}
+	c.appendable.Upload(debuginfo.UploadJob{
+		FrameMappingFileData: mf,
+		Open:                 open,
+		InitArguments:        c.args.DebugInfoArguments,
+	})
+}
+
 // NewDefaultArguments create the default settings for a scrape job.
 func NewDefaultArguments() Arguments {
 	return Arguments{
@@ -272,10 +366,20 @@ func NewDefaultArguments() Arguments {
 		VerboseMode:     false,
 		LazyMode:        false,
 
+		Comm:         string(rargs.CommModeNone),
+		KernelFrames: true,
+
 		// undocumented
 		PyroscopeDynamicProfilingPolicy: true,
 		SymbCachePath:                   "/tmp/symb-cache",
 		SymbCacheSizeEntries:            2048,
+		SymbCacheEnabled:                true,
+		DebugInfoArguments: debuginfo.Arguments{
+			UploadEnabled: false,
+			CacheSize:     1024,
+			QueueSize:     64,
+			WorkerNum:     4,
+		},
 	}
 }
 
@@ -301,7 +405,7 @@ func (args *Arguments) Convert() (*controller.Config, error) {
 	cfg.Tracers = args.tracers()
 	cfg.OffCPUThreshold = args.OffCPUThreshold
 	cfg.LoadProbe = args.LoadProbe
-	cfg.UProbeLinks = args.UProbeLinks
+	cfg.ProbeLinks = args.UProbeLinks
 	cfg.VerboseMode = args.VerboseMode
 	return cfg, nil
 }
@@ -335,15 +439,15 @@ func (args *Arguments) tracers() string {
 	return strings.Join(tracers, ",")
 }
 
-func (args *Arguments) targetsOptions(dynamicProfilingPolicy bool) discovery2.TargetsOptions {
-	targets := make([]discovery2.DiscoveredTarget, 0, len(args.Targets))
+func (args *Arguments) targetsOptions(dynamicProfilingPolicy bool) alloydiscovery.TargetsOptions {
+	targets := make([]alloydiscovery.DiscoveredTarget, 0, len(args.Targets))
 	for _, t := range args.Targets {
 		targets = append(targets, t.AsMap())
 	}
-	return discovery2.TargetsOptions{
+	return alloydiscovery.TargetsOptions{
 		Targets:     targets,
 		TargetsOnly: dynamicProfilingPolicy,
-		DefaultTarget: discovery2.DiscoveredTarget{
+		DefaultTarget: alloydiscovery.DiscoveredTarget{
 			"service_name": "ebpf/unspecified",
 		},
 	}

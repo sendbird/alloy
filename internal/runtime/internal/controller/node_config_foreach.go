@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"hash/fnv"
+	"log/slog"
 	"path"
 	"reflect"
 	"strings"
@@ -13,13 +14,12 @@ import (
 	"time"
 	"unicode"
 
-	"github.com/go-kit/log"
 	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/grafana/alloy/internal/component"
 	"github.com/grafana/alloy/internal/nodeconf/foreach"
 	"github.com/grafana/alloy/internal/runner"
-	"github.com/grafana/alloy/internal/runtime/logging/level"
+	"github.com/grafana/alloy/syntax"
 	"github.com/grafana/alloy/syntax/ast"
 	"github.com/grafana/alloy/syntax/vm"
 )
@@ -36,7 +36,7 @@ type ForeachConfigNode struct {
 	componentName    string
 	moduleController ModuleController
 
-	logger log.Logger
+	logger *slog.Logger
 
 	// customReg is the customComponentRegistry of the current loader.
 	// We pass it so that the foreach children have access to modules.
@@ -80,7 +80,7 @@ func NewForeachConfigNode(block *ast.BlockStmt, globals ComponentGlobals, custom
 		block:                     block,
 		componentName:             block.GetBlockName(),
 		id:                        BlockComponentID(block),
-		logger:                    log.With(globals.Logger, "component_path", globals.ControllerID, "component_id", nodeID),
+		logger:                    globals.Logger.Slog().With("component_path", globals.ControllerID, "component_id", nodeID),
 		moduleControllerFactory:   globals.NewModuleController,
 		moduleControllerOpts:      ModuleControllerOpts{Id: globalID},
 		customReg:                 customReg,
@@ -200,13 +200,9 @@ func (fn *ForeachConfigNode) evaluate(scope *vm.Scope) error {
 
 		// Extract Id from collection if exists
 		if args.Id != "" {
-			if m, ok := args.Collection[i].(map[string]any); ok {
-				if val, exists := m[args.Id]; exists {
-					// Use the field's value for fingerprinting
-					id = val
-				} else {
-					level.Warn(fn.logger).Log("msg", "specified id not found in collection item", "id", args.Id)
-				}
+			if val, ok := collectionItemID(args.Collection[i], args.Id, fn.logger); ok {
+				// Use the field's value for fingerprinting
+				id = val
 			}
 		}
 
@@ -224,7 +220,7 @@ func (fn *ForeachConfigNode) evaluate(scope *vm.Scope) error {
 		}
 
 		if created && args.HashStringId && id != nil && reflect.TypeOf(id).Kind() == reflect.String {
-			level.Debug(fn.logger).Log("msg", "a new foreach pipeline was created", "value", id, "fingerprint", customComponentID)
+			fn.logger.Debug("a new foreach pipeline was created", "value", id, "fingerprint", customComponentID)
 		}
 
 		// Expose the current scope + the collection item that correspond to the child.
@@ -298,7 +294,7 @@ func (fn *ForeachConfigNode) Run(ctx context.Context) error {
 			tasks = append(tasks, &forEachChild{
 				id:           customComponentID,
 				cc:           customComponent,
-				logger:       log.With(fn.logger, "foreach_path", fn.nodeID, "child_id", customComponentID),
+				logger:       fn.logger.With("foreach_path", fn.nodeID, "child_id", customComponentID),
 				healthUpdate: fn.setRunHealth,
 			})
 		}
@@ -324,7 +320,7 @@ func (fn *ForeachConfigNode) run(ctx context.Context, updateTasks func() error) 
 		case <-fn.forEachChildrenUpdateChan:
 			err := updateTasks()
 			if err != nil {
-				level.Error(fn.logger).Log("msg", "error encountered while updating foreach children", "err", err)
+				fn.logger.Error("error encountered while updating foreach children", "err", err)
 				fn.setRunHealth(component.HealthTypeUnhealthy, fmt.Sprintf("error encountered while updating foreach children: %s", err))
 				// the error is not fatal, the node can still run in unhealthy mode
 			} else {
@@ -395,14 +391,14 @@ type forEachChildRunner struct {
 type forEachChild struct {
 	cc           CustomComponent
 	id           string
-	logger       log.Logger
+	logger       *slog.Logger
 	healthUpdate func(t component.HealthType, msg string)
 }
 
 func (fr *forEachChildRunner) Run(ctx context.Context) {
 	err := fr.child.cc.Run(ctx)
 	if err != nil {
-		level.Error(fr.child.logger).Log("msg", "foreach child stopped running", "err", err)
+		fr.child.logger.Error("foreach child stopped running", "err", err)
 		fr.child.healthUpdate(component.HealthTypeUnhealthy, fmt.Sprintf("foreach child stopped running: %s", err))
 	}
 }
@@ -442,6 +438,63 @@ func objectFingerprint(id any, hashId bool) string {
 	default:
 		return computeHash(fmt.Sprintf("%#v", v))
 	}
+}
+
+func collectionItemID(item any, key string, logger *slog.Logger) (any, bool) {
+	switch value := item.(type) {
+	case map[string]any:
+		// Inline object literals with simple values.
+		// Example: collection = [{name = "one", port = "8080"}, {name = "two", port = "8081"}]
+		val, ok := value[key]
+		if !ok {
+			logMissingCollectionID(logger, key)
+			return nil, false
+		}
+		return val, true
+	case map[string]string:
+		// Plain Go maps - used to be common, but are now replaced by Target capsules for performance.
+		// We keep it for maximum compatibility in case it's needed in the future.
+		val, ok := value[key]
+		if !ok {
+			logMissingCollectionID(logger, key)
+			return nil, false
+		}
+		return val, true
+	case map[string]syntax.Value:
+		// Inline object literals with expressions or computed values.
+		// Example: collection = [{name = "one", url = "http://" + hostname}]
+		val, ok := value[key]
+		if !ok {
+			logMissingCollectionID(logger, key)
+			return nil, false
+		}
+		return val.Interface(), true
+	case syntax.ConvertibleIntoCapsule:
+		// Capsules from component exports, such as discovery.Target.
+		// Example: collection = discovery.kubernetes.pods.targets
+		return collectionItemIDFromCapsule(value, key, logger)
+	default:
+		logger.Debug("unsupported collection item type encountered in foreach", "item", fmt.Sprintf("%#v", item))
+		return nil, false
+	}
+}
+
+func collectionItemIDFromCapsule(value syntax.ConvertibleIntoCapsule, key string, logger *slog.Logger) (any, bool) {
+	var obj map[string]syntax.Value
+	if err := value.ConvertInto(&obj); err == nil {
+		val, ok := obj[key]
+		if ok {
+			return val.Interface(), true
+		}
+		logMissingCollectionID(logger, key)
+		return nil, false
+	}
+
+	return nil, false
+}
+
+func logMissingCollectionID(logger *slog.Logger, key string) {
+	logger.Warn("specified id not found in collection item", "id", key)
 }
 
 func replaceNonAlphaNumeric(s string) string {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/DataDog/go-sqllexer"
@@ -31,11 +32,15 @@ const selectQueryTablesSamples = `
 		query_sample_text
 	FROM performance_schema.events_statements_summary_by_digest
 	WHERE last_seen > DATE_SUB(NOW(), INTERVAL 1 DAY)
-	AND schema_name NOT IN ` + EXCLUDED_SCHEMAS
+	AND schema_name NOT IN %s
+	ORDER BY last_seen DESC
+	LIMIT %d`
 
 type QueryDetailsArguments struct {
 	DB              *sql.DB
 	CollectInterval time.Duration
+	StatementsLimit int
+	ExcludeSchemas  []string
 	EntryHandler    loki.EntryHandler
 
 	Logger log.Logger
@@ -44,6 +49,8 @@ type QueryDetailsArguments struct {
 type QueryDetails struct {
 	dbConnection    *sql.DB
 	collectInterval time.Duration
+	statementsLimit int
+	excludeSchemas  []string
 	entryHandler    loki.EntryHandler
 	sqlParser       parser.Parser
 	normalizer      *sqllexer.Normalizer
@@ -52,12 +59,15 @@ type QueryDetails struct {
 	running *atomic.Bool
 	ctx     context.Context
 	cancel  context.CancelFunc
+	wg      sync.WaitGroup
 }
 
 func NewQueryDetails(args QueryDetailsArguments) (*QueryDetails, error) {
 	c := &QueryDetails{
 		dbConnection:    args.DB,
 		collectInterval: args.CollectInterval,
+		statementsLimit: args.StatementsLimit,
+		excludeSchemas:  args.ExcludeSchemas,
 		entryHandler:    args.EntryHandler,
 		sqlParser:       parser.NewTiDBSqlParser(),
 		normalizer:      sqllexer.NewNormalizer(sqllexer.WithCollectTables(true)),
@@ -80,13 +90,11 @@ func (c *QueryDetails) Start(ctx context.Context) error {
 	c.ctx = ctx
 	c.cancel = cancel
 
-	go func() {
-		defer func() {
-			c.Stop()
-			c.running.Store(false)
-		}()
+	c.wg.Go(func() {
+		defer c.running.Store(false)
 
 		ticker := time.NewTicker(c.collectInterval)
+		defer ticker.Stop()
 
 		for {
 			if err := c.tablesFromEventsStatements(c.ctx); err != nil {
@@ -100,7 +108,7 @@ func (c *QueryDetails) Start(ctx context.Context) error {
 				// continue loop
 			}
 		}
-	}()
+	})
 
 	return nil
 }
@@ -109,20 +117,24 @@ func (c *QueryDetails) Stopped() bool {
 	return !c.running.Load()
 }
 
-// Stop should be kept idempotent
 func (c *QueryDetails) Stop() {
-	c.cancel()
+	if c.cancel != nil {
+		c.cancel()
+	}
+	c.wg.Wait()
 }
 
 func (c *QueryDetails) tablesFromEventsStatements(ctx context.Context) error {
-	rs, err := c.dbConnection.QueryContext(ctx, selectQueryTablesSamples)
+	query := fmt.Sprintf(selectQueryTablesSamples, buildExcludedSchemasClause(c.excludeSchemas), c.statementsLimit)
+	rs, err := c.dbConnection.QueryContext(ctx, query)
 	if err != nil {
 		return fmt.Errorf("failed to fetch summary table samples: %w", err)
 	}
 	defer rs.Close()
 
 	for rs.Next() {
-		var digest, digestText, schema, sampleText string
+		var digest, digestText, schema string
+		var sampleText sql.NullString
 		if err := rs.Scan(&digest, &digestText, &schema, &sampleText); err != nil {
 			level.Error(c.logger).Log("msg", "failed to scan result set from summary table samples", "schema", schema, "err", err)
 			continue
@@ -130,8 +142,8 @@ func (c *QueryDetails) tablesFromEventsStatements(ctx context.Context) error {
 
 		var tables []string
 		var parserErr, lexerErr error
-		if tables, parserErr = c.tryParseTableNames(sampleText, digestText); parserErr != nil {
-			if tables, lexerErr = c.tryTokenizeTableNames(sampleText, digestText); lexerErr != nil {
+		if tables, parserErr = c.tryParseTableNames(sampleText.String, digestText); parserErr != nil {
+			if tables, lexerErr = c.tryTokenizeTableNames(sampleText.String, digestText); lexerErr != nil {
 				level.Warn(c.logger).Log("msg", "failed to extract tables from sql text", "schema", schema, "digest", digest, "parser_err", parserErr, "lexer_err", lexerErr)
 				continue
 			}

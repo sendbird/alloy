@@ -124,8 +124,9 @@ func TestInstanceKey(t *testing.T) {
 			testName:      "cloudwatch",
 			componentName: "prometheus.exporter.cloudwatch",
 			args: cloudwatch.Arguments{
-				STSRegion:    "us-west-2",
-				FIPSDisabled: true,
+				STSRegion:         "us-west-2",
+				FIPSDisabled:      true,
+				UseAWSSDKVersion2: true,
 				Discovery: []cloudwatch.DiscoveryJob{
 					{
 						Type: "AWS/EC2",
@@ -399,7 +400,7 @@ func TestInstanceKey(t *testing.T) {
 			testName:      "windows",
 			componentName: "prometheus.exporter.windows",
 			args: windows.Arguments{
-				EnabledCollectors: []string{"cpu", "logical_disk", "net", "os", "service", "system"},
+				EnabledCollectors: []string{},
 				LogicalDisk: windows.LogicalDiskConfig{
 					EnabledList: []string{"metrics"},
 				},
@@ -425,7 +426,7 @@ func TestInstanceKey(t *testing.T) {
 			var capturedExports exporter.Exports
 			opts := component.Options{
 				ID: tt.componentName + ".test_comp_id",
-				GetServiceData: func(name string) (interface{}, error) {
+				GetServiceData: func(name string) (any, error) {
 					switch name {
 					case httpservice.ServiceName:
 						return httpservice.Data{

@@ -13,6 +13,7 @@ import (
 	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/kafka/configkafka"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/collector/config/configcompression"
+	"go.opentelemetry.io/collector/config/configoptional"
 	"go.opentelemetry.io/collector/config/configretry"
 	"go.opentelemetry.io/collector/exporter/exporterhelper"
 )
@@ -23,7 +24,7 @@ func TestArguments_UnmarshalAlloy(t *testing.T) {
 			TimeoutSettings: exporterhelper.TimeoutConfig{
 				Timeout: 5 * time.Second,
 			},
-			QueueBatchConfig: exporterhelper.NewDefaultQueueConfig(),
+			QueueBatchConfig: configoptional.Some(exporterhelper.NewDefaultQueueConfig()),
 			Logs: kafkaexporter.SignalConfig{
 				Topic:                "otlp_logs",
 				TopicFromMetadataKey: "",
@@ -64,6 +65,7 @@ func TestArguments_UnmarshalAlloy(t *testing.T) {
 				Brokers:         []string{"localhost:9092"},
 				ProtocolVersion: "2.0.0",
 				ClientID:        "otel-collector",
+				ConnIdleTimeout: 9 * time.Minute,
 				Metadata: configkafka.MetadataConfig{
 					Full:            true,
 					RefreshInterval: 10 * time.Minute,
@@ -80,6 +82,7 @@ func TestArguments_UnmarshalAlloy(t *testing.T) {
 				CompressionParams: configcompression.CompressionParams{
 					Level: 0,
 				},
+				FlushMaxMessages:       10000,
 				AllowAutoTopicCreation: true,
 			},
 		}
@@ -274,13 +277,12 @@ func TestArguments_UnmarshalAlloy(t *testing.T) {
 				TimeoutSettings: exporterhelper.TimeoutConfig{
 					Timeout: 12 * time.Second,
 				},
-				QueueBatchConfig: exporterhelper.QueueBatchConfig{
-					Enabled:      true,
+				QueueBatchConfig: configoptional.Some(exporterhelper.QueueBatchConfig{
 					NumConsumers: 11,
 					QueueSize:    1001,
 					Sizer:        exporterhelper.RequestSizerTypeRequests,
 					Batch:        exporterhelper.NewDefaultQueueConfig().Batch,
-				},
+				}),
 				Logs: kafkaexporter.SignalConfig{
 					Topic:                "logs_test_topic",
 					TopicFromMetadataKey: "",
@@ -313,6 +315,7 @@ func TestArguments_UnmarshalAlloy(t *testing.T) {
 					Brokers:                              []string{"redpanda:123"},
 					ProtocolVersion:                      "2.0.0",
 					ClientID:                             "my-client",
+					ConnIdleTimeout:                      9 * time.Minute,
 					ResolveCanonicalBootstrapServersOnly: true,
 					Metadata: configkafka.MetadataConfig{
 						Full:            false,

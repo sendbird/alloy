@@ -32,10 +32,11 @@ func (kafkaExporterConverter) ConvertAndAppend(state *State, id componentstatus.
 	var diags diag.Diagnostics
 
 	label := state.AlloyComponentLabel()
-	overrideHook := func(val interface{}) interface{} {
+	overrideHook := func(val any) any {
 		switch val.(type) {
 		case extension.ExtensionHandler:
-			ext := state.LookupExtension(*cfg.(*kafkaexporter.Config).QueueBatchConfig.StorageID)
+			queue := cfg.(*kafkaexporter.Config).QueueBatchConfig.GetOrInsertDefault()
+			ext := state.LookupExtension(*queue.StorageID)
 			return common.CustomTokenizer{Expr: fmt.Sprintf("%s.%s.handler", strings.Join(ext.Name, "."), ext.Label)}
 		}
 		return common.GetAlloyTypesOverrideHook()(val)
@@ -74,10 +75,10 @@ func toKafkaExporter(cfg *kafkaexporter.Config) *kafka.Arguments {
 		PartitionLogsByTraceID:               cfg.PartitionLogsByTraceID,
 		IncludeMetadataKeys:                  cfg.IncludeMetadataKeys,
 		Timeout:                              cfg.TimeoutSettings.Timeout,
-
-		Logs:    toKafkaSignalConfig(cfg.Logs),
-		Metrics: toKafkaSignalConfig(cfg.Metrics),
-		Traces:  toKafkaSignalConfig(cfg.Traces),
+		ConnIdleTimeout:                      cfg.ConnIdleTimeout,
+		Logs:                                 toKafkaSignalConfig(cfg.Logs),
+		Metrics:                              toKafkaSignalConfig(cfg.Metrics),
+		Traces:                               toKafkaSignalConfig(cfg.Traces),
 
 		Authentication: toKafkaAuthentication(encodeMapstruct(cfg.Authentication)),
 		Metadata:       toKafkaMetadata(cfg.Metadata),
