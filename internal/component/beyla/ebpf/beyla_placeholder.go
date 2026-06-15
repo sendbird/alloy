@@ -1,4 +1,4 @@
-//go:build !(linux && (arm64 || amd64))
+//go:build !((linux && arm64) || (linux && amd64)) || noebpf
 
 package beyla
 
